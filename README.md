@@ -1,214 +1,100 @@
 # n8n-nodes-goodmem
 
-This is an n8n community node that integrates with [Goodmem](https://goodmem.ai), a semantic memory and knowledge storage platform. It enables n8n workflows to store, retrieve, and manage semantic memories with powerful embedding and search capabilities.
+An n8n community node for [GoodMem](https://goodmem.ai), a self-hostable
+semantic memory service: store text and files, search them in natural
+language, and manage the spaces they live in — from any n8n workflow, or as a
+tool for an n8n AI agent.
 
-![n8n.io - Workflow Automation](https://raw.githubusercontent.com/n8n-io/n8n/master/assets/n8n-logo.png)
+The node has no runtime dependencies and talks to GoodMem through n8n's own
+request helpers, as community-node verification requires.
 
-## Features
+## Install
 
-- **Spaces Management** - Create and delete memory spaces (containers for organizing memories)
-- **Memory Operations** - Full CRUD operations for storing and retrieving memories
-- **Semantic Search** - Retrieve memories using natural language queries with relevance scoring
-- **Flexible Chunking** - Configure recursive, sentence-based, or custom chunking strategies
-- **Advanced Retrieval** - Post-processing with reranking, LLM generation, and relevance filtering
-- **Metadata Support** - Tag memories and spaces with custom labels and metadata for filtering
-
-## Table of Contents
-
-- [Prerequisites](#prerequisites)
-- [Installation](#installation)
-- [Credentials](#credentials)
-- [Operations](#operations)
-- [Usage Examples](#usage-examples)
-- [Chunking Strategies](#chunking-strategies)
-- [Advanced Retrieval Options](#advanced-retrieval-options)
-- [Development](#development)
-- [Resources](#resources)
-- [License](#license)
-
-## Prerequisites
-
-- [n8n](https://n8n.io/) version 1.60.0 or later
-- A Goodmem account with API access
-- Goodmem API key and server URL
-
-## Installation
-
-### Goodmem Installation
-
-Configure a goodmem server to connect to before using the node.
-Visit https://goodmem.ai/quick-start for more instructions. Consider using the Railway or Fly.io installation for quick access to the Goodmem API over the internet.
-
-### Community Nodes (Recommended)
-
-1. Open your n8n instance
-2. Go to **Settings** > **Community Nodes**
-3. Select **Install**
-4. Enter `@pairsystems/n8n-nodes-goodmem` and click **Install**
-
-### Manual Installation
+**Settings → Community Nodes → Install** and enter
+`@pairsystems/n8n-nodes-goodmem`, or:
 
 ```bash
-cd ~/.n8n/nodes
-npm install @pairsystems/n8n-nodes-goodmem
+cd ~/.n8n/nodes && npm install @pairsystems/n8n-nodes-goodmem
 ```
 
-Then restart your n8n instance.
+Requires n8n 1.60 or later. Version 2.0 is a break from 1.x — see
+[CHANGELOG](CHANGELOG.md) for the parameter mapping.
 
 ## Credentials
 
-Before using the node, configure your Goodmem credentials:
-
-1. In n8n, go to **Credentials** > **New**
-2. Search for **Goodmem API**
-3. Enter the following:
-   - **Goodmem Server**: Your Goodmem API server URL
-   - **Goodmem API Key**: Your API key for authentication
+Create a **Goodmem API** credential with your server URL (for example
+`https://goodmem.example.com`) and an API key. The credential test lists your
+spaces. For a server with a private certificate authority, mount the CA under
+`/opt/custom-certificates` as n8n documents.
 
 ## Operations
 
-### Spaces
+| Resource | Operations |
+| --- | --- |
+| Memory | Retrieve (semantic search), Create, Get, Download Content, List, Delete |
+| Space | Create, Get, List, Update, Delete |
+| Embedder | List |
+| Reranker | List |
 
-| Operation | Description |
-|-----------|-------------|
-| **Create** | Create a new semantic memory space with custom embedders and chunking configuration |
-| **Delete** | Remove an existing space and all its memories |
+### Retrieve
 
-### Memories
+Give it a query and one or more space IDs. Each matching passage becomes an
+output item:
 
-| Operation | Description |
-|-----------|-------------|
-| **Create** | Store new content as a memory with optional chunking and metadata |
-| **Get** | Retrieve a memory's metadata and optionally its content and processing history |
-| **Delete** | Remove a specific memory from a space |
-| **Download Content** | Retrieve the original content of a stored memory |
-| **Retrieve** | Perform semantic search across one or more spaces with natural language |
-
-## Usage Examples
-
-### Creating a Memory Space
-
-Configure a space to store knowledge base documents:
-
-1. Add the **Goodmem** node to your workflow
-2. Select **Space** as the resource and **Create** as the operation
-3. Enter a **Space Name** (e.g., "Product Documentation")
-4. Configure an embedder with ID and retrieval weight
-5. Optionally set labels for organization (e.g., `environment: production`)
-
-### Storing a Memory
-
-Add content to your space:
-
-1. Select **Memory** as the resource and **Create** as the operation
-2. Provide the **Space ID** where the memory will be stored
-3. Enter the **Content** (text, markdown, etc.)
-4. Optionally configure chunking strategy:
-   - **Recursive**: Splits by separators with configurable chunk size and overlap
-   - **Sentence**: Splits on sentence boundaries
-   - **None**: Store content as a single chunk
-
-### Semantic Search
-
-Retrieve relevant memories using natural language:
-
-1. Select **Memory** as the resource and **Retrieve** as the operation
-2. Enter your **Message** (search query)
-3. Optionally filter by:
-   - Specific **Space IDs**
-   - **Filter expressions** for metadata matching
-   - **Relevance threshold** (0-1)
-4. Configure post-processing:
-   - **Reranker**: Improve result relevance ordering
-   - **LLM Generation**: Generate responses based on retrieved context
-
-## Chunking Strategies
-
-The node supports flexible chunking for optimal embedding and retrieval:
-
-### Recursive Chunking (Default)
-
-Best for general-purpose document processing:
-
-- **Chunk Size**: Target size for each chunk (default: 512)
-- **Chunk Overlap**: Overlap between chunks for context continuity (default: 64)
-- **Separators**: Custom separators for splitting (paragraphs, sentences, etc.)
-- **Length Unit**: Characters or tokens
-
-### Sentence-Based Chunking
-
-Preserves sentence boundaries:
-
-- **Max Chunk Size**: Maximum characters/tokens per chunk
-- **Min Chunk Size**: Minimum chunk size threshold
-
-### Custom JSON
-
-For advanced configurations, provide a custom chunking strategy as JSON.
-
-## Advanced Retrieval Options
-
-Fine-tune search results with post-processing:
-
-| Option | Description |
-|--------|-------------|
-| **Reranker ID** | UUID of a reranker model to improve result ordering |
-| **LLM ID** | UUID of an LLM to generate contextual responses |
-| **Relevance Threshold** | Minimum score (0-1) for including results |
-| **LLM Temperature** | Creativity setting for LLM generation (0-2) |
-| **Max Results** | Limit the number of returned memories |
-| **Chronological Resort** | Reorder results by creation time |
-
-## Example Workflow: AI-Powered Q&A System
-
-```
-[Webhook Trigger] --> [Goodmem: Retrieve] --> [OpenAI: Generate Response] --> [Respond to Webhook]
+```json
+{
+  "chunkText": "Refunds above $500 need a manager's approval.",
+  "score": -0.53, "scoreKind": "vector",
+  "chunkId": "…", "memoryId": "…", "spaceId": "…", "source": "…",
+  "metadata": { "title": "handbook", "category": "policy" },
+  "partial": false, "statuses": []
+}
 ```
 
-1. **Webhook Trigger**: Receives a user question
-2. **Goodmem Retrieve**: Searches semantic memories for relevant context
-3. **OpenAI**: Generates an answer using the retrieved context
-4. **Response**: Returns the AI-generated answer
+- `partial` is `true` when part of the search did not complete — a reranker was
+  unavailable, one space was unreachable. The passages are usable but may be
+  incomplete, and `statuses` says why. A search that produced nothing usable
+  fails the node with the server's reason; an empty result is simply no items.
+- `score` is passed through exactly as GoodMem reports it. Vector scores are
+  opaque similarities that can be negative; reranker scores are relevance
+  values. `scoreKind` says which you have. **Relevance Threshold** therefore
+  needs a Reranker ID.
+- **Filter** is a GoodMem expression applied to every space, e.g.
+  `CAST(val('$.category') AS TEXT) = 'policy'`. Inside a quoted value escape
+  `'` as `\'` and `\` as `\\`.
+- Set an **LLM ID** to also get an `abstractReply` on the first item.
+
+### Create
+
+Stores text, or a file from a binary property of the incoming item (a PDF from
+an HTTP Request or Read Binary File node). By default it **waits until the
+memory is indexed**, so a Retrieve later in the same workflow finds it. Turn
+"Wait for Indexing" off to return immediately with `processingStatus: PENDING`.
+
+### Get and Download Content
+
+Text content is returned decoded in a `content` field. Anything else — PDFs,
+images — is returned as n8n binary data (property `data` by default), bytes
+intact, ready for a Write Binary File or another node.
+
+### Using the node as an AI tool
+
+The node is marked usable as a tool. Any field you map with `$fromAI()` is then
+chosen by the model; keep **Space IDs** and **Filter** fixed unless you intend
+the agent to pick them.
 
 ## Development
 
-### Building
-
 ```bash
-npm install
-npm run build
-```
-
-### Linting
-
-```bash
+npm install --ignore-scripts   # @n8n/node-cli pulls a native module you do not need
 npm run lint
-npm run lint:fix
+npm test                        # builds, then runs the regression suite
 ```
 
-### Local Testing
-
-Link the node to your local n8n installation:
-
-```bash
-npm link
-cd ~/.n8n/nodes
-npm link @pairsystems/n8n-nodes-goodmem
-```
-
-## Compatibility
-
-Compatible with n8n version 1.60.0 or later.
-
-## Resources
-
-- [n8n Community Nodes Documentation](https://docs.n8n.io/integrations/community-nodes/)
-- [Goodmem Documentation](https://docs.goodmem.ai)
+The tests run the built node against a local HTTP server using event shapes
+captured from a live GoodMem server. Lint uses n8n's strict cloud-compatibility
+configuration unchanged.
 
 ## License
 
 [MIT](LICENSE.md)
-
-## Author
-
-Zaid Abdulrehman (zaid.abdulrehman@pairsys.ai)

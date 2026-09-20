@@ -1,4 +1,102 @@
-import { NodeConnectionTypes, type INodeType, type INodeTypeDescription } from 'n8n-workflow';
+import type {
+	IDataObject,
+	IExecuteFunctions,
+	INodeExecutionData,
+	INodeType,
+	INodeTypeDescription,
+	JsonObject,
+} from 'n8n-workflow';
+import { NodeApiError, NodeConnectionTypes, NodeOperationError } from 'n8n-workflow';
+
+import type { GoodmemResponse } from './GenericFunctions';
+import {
+	abstractReply,
+	classify,
+	decodeText,
+	fileNameFor,
+	goodmemRequest,
+	hitsFromEvents,
+	isTextual,
+	listAll,
+	parseNdjson,
+	waitForMemory,
+} from './GenericFunctions';
+
+const CHUNKING_PROPERTIES = (resource: string, operation: string): INodeTypeDescription['properties'] => [
+	{
+		displayName: 'Chunking',
+		name: 'chunking',
+		type: 'options',
+		noDataExpression: true,
+		default: 'default',
+		options: [
+			{ name: 'Server Default', value: 'default' },
+			{ name: 'None (Single Chunk)', value: 'none' },
+			{ name: 'Custom (JSON)', value: 'custom' },
+		],
+		displayOptions: { show: { resource: [resource], operation: [operation] } },
+		description: 'How content is split into chunks before embedding',
+	},
+	{
+		displayName: 'Chunking Config (JSON)',
+		name: 'chunkingConfigJson',
+		type: 'json',
+		default: '{"recursive":{"chunkSize":512,"chunkOverlap":64}}',
+		displayOptions: { show: { resource: [resource], operation: [operation], chunking: ['custom'] } },
+		description:
+			'A GoodMem chunking configuration, e.g. {"recursive":{"chunkSize":512,"chunkOverlap":64}} or {"sentence":{"maxChunkSize":4000,"minChunkSize":100}}',
+	},
+];
+
+const KEY_VALUE_COLLECTION = (
+	displayName: string,
+	name: string,
+	description: string,
+	show: IDataObject,
+): INodeTypeDescription['properties'][number] => ({
+	displayName,
+	name,
+	type: 'fixedCollection',
+	typeOptions: { multipleValues: true },
+	placeholder: `Add ${displayName.replace(/s$/, '')}`,
+	default: {},
+	displayOptions: { show: show as never },
+	description,
+	options: [
+		{
+			displayName: 'Entry',
+			name: 'entries',
+			values: [
+				{ displayName: 'Key', name: 'key', type: 'string', default: '' },
+				{ displayName: 'Value', name: 'value', type: 'string', default: '' },
+			],
+		},
+	],
+});
+
+function collectionToObject(value: unknown): IDataObject {
+	const out: IDataObject = {};
+	const entries = ((value as IDataObject | undefined)?.entries ?? []) as IDataObject[];
+	for (const entry of entries) {
+		const key = String(entry.key ?? '').trim();
+		if (key) out[key] = entry.value ?? '';
+	}
+	return out;
+}
+
+function parseJsonParameter(this: IExecuteFunctions, raw: unknown, name: string, i: number): IDataObject {
+	if (raw && typeof raw === 'object' && !Array.isArray(raw)) return raw as IDataObject;
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(String(raw ?? ''));
+	} catch {
+		parsed = undefined;
+	}
+	if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+		throw new NodeOperationError(this.getNode(), `${name} must be a JSON object.`, { itemIndex: i });
+	}
+	return parsed as IDataObject;
+}
 
 export class Goodmem implements INodeType {
 	description: INodeTypeDescription = {
@@ -6,1205 +104,694 @@ export class Goodmem implements INodeType {
 		name: 'goodmem',
 		icon: { light: 'file:../../icons/goodmem.svg', dark: 'file:../../icons/goodmem.dark.svg' },
 		group: ['input'],
-		version: 1,
+		version: 2,
 		subtitle: '={{$parameter["operation"] + ": " + $parameter["resource"]}}',
-		description: 'Consume Goodmem API',
-		defaults: {
-			name: 'Goodmem',
-		},
+		description: 'Store, search and manage memories in Goodmem',
+		defaults: { name: 'Goodmem' },
 		usableAsTool: true,
 		inputs: [NodeConnectionTypes.Main],
 		outputs: [NodeConnectionTypes.Main],
-		credentials: [
-			{
-				name: 'goodmemApi',
-				required: true,
-				displayOptions: {
-					show: {
-						authentication: ['goodmemApi'],
-					},
-				},
-			},
-		],
-		requestDefaults: {
-			baseURL: '={{$credentials.server.replace(/\\/$/, "") + "/v1"}}',
-			headers: {
-				Accept: 'application/json',
-				'Content-Type': 'application/json',
-			},
-		},
+		credentials: [{ name: 'goodmemApi', required: true }],
 		properties: [
-			/*
-			 * ============================================
-			 *            AUTHENTICATION
-			 * ============================================
-			 */
-			{
-				displayName: 'Authentication',
-				name: 'authentication',
-				type: 'options',
-				options: [
-					{
-						name: 'API Key',
-						value: 'goodmemApi',
-					},
-				],
-				default: 'goodmemApi',
-			},
-
-			/*
-			 * ============================================
-			 *            RESOURCE SELECTOR
-			 * ============================================
-			 */
 			{
 				displayName: 'Resource',
 				name: 'resource',
-				type: 'options', 
+				type: 'options',
 				noDataExpression: true,
 				options: [
-					{
-						name: 'Space',
-						value: 'space',
-					},
-					{
-						name: 'Memory',
-						value: 'memory',
-					},
+					{ name: 'Embedder', value: 'embedder' },
+					{ name: 'Memory', value: 'memory' },
+					{ name: 'Reranker', value: 'reranker' },
+					{ name: 'Space', value: 'space' },
 				],
 				default: 'memory',
 			},
 
-			/*
-			 * ============================================
-			 *            SPACE OPERATIONS
-			 * ============================================
-			 */
+			/* ------------------------------------------------ embedder / reranker */
 			{
 				displayName: 'Operation',
 				name: 'operation',
-				type: 'options',  // TODO: add update action
+				type: 'options',
 				noDataExpression: true,
-				displayOptions: {
-					show: {
-						resource: ['space'],
-					},
-				},
-				options: [
-					{
-						name: 'Create',
-						value: 'create',
-						description: 'Create a space for use in Goodmem',
-						action: 'Create a space',
-						routing: {
-							request: {
-								method: 'POST',
-								url: '/spaces',
-							},
-						},
-					},
-					{
-						name: 'Delete',
-						value: 'delete',
-						description: 'Delete an existing space in Goodmem',
-						action: 'Delete a space',
-						routing: {
-							request: {
-								method: 'DELETE',
-								url: '=/spaces/{{$parameter.requiredSpaceId}}',
-							},
-						},
-					},
-				],
-				default: 'create',
+				displayOptions: { show: { resource: ['embedder'] } },
+				options: [{ name: 'List', value: 'list', description: 'List embedders', action: 'List embedders' }],
+				default: 'list',
 			},
-
-			/*
-			 * ============================================
-			 *            MEMORY OPERATIONS
-			 * ============================================
-			 */
 			{
 				displayName: 'Operation',
 				name: 'operation',
-				type: 'options',  // TODO: change this accordingly
+				type: 'options',
 				noDataExpression: true,
-				displayOptions: {
-					show: {
-						resource: ['memory'],
-					},
-				},
-				options: [ //todo: add delete multiple, create multiple, advanced retrieval with json, download
-					{
-						name: 'Create',
-						value: 'create',
-						description: 'Create a memory for use in Goodmem',
-						action: 'Create a memory',
-						routing: {
-							request: {
-								method: 'POST',
-								url: '/memories',
-							},
-						},
-					},
-					{
-						name: 'Delete',
-						value: 'delete',
-						description: 'Delete an existing memory in Goodmem',
-						action: 'Delete a memory',
-						routing: {
-							request: {
-								method: 'DELETE',
-								url: '=/memories/{{$parameter.memoryIdRequired}}',
-							},
-						},
-					},
-					{
-						name: 'Download Content',
-						value: 'downloadContent',
-						description: 'Download the original content of a memory',
-						action: 'Download memory content',
-						routing: {
-							request: {
-								method: 'GET',
-								url: '=/memories/{{$parameter.memoryIdRequired}}/content',
-							},
-						},
-					},
-					{
-						name: 'Get',
-						value: 'get',
-						description: 'Get a memory by its ID in Goodmem',
-						action: 'Get a memory',
-						routing: {
-							request: {
-								method: 'GET',
-								url: '=/memories/{{$parameter.memoryIdRequired}}',
-							},
-						},
-					},
-					{
-						name: 'Retrieve',
-						value: 'retrieve',
-						description: 'Search memories semantically in Goodmem',
-						action: 'Retrieve memories',
-						routing: {
-							request: {
-								method: 'GET',
-								url: '/memories:retrieve',
-							},
-						},
-					},
+				displayOptions: { show: { resource: ['reranker'] } },
+				options: [{ name: 'List', value: 'list', description: 'List rerankers', action: 'List rerankers' }],
+				default: 'list',
+			},
+
+			/* ------------------------------------------------------------ space */
+			{
+				displayName: 'Operation',
+				name: 'operation',
+				type: 'options',
+				noDataExpression: true,
+				displayOptions: { show: { resource: ['space'] } },
+				options: [
+					{ name: 'Create', value: 'create', description: 'Create a space', action: 'Create a space' },
+					{ name: 'Delete', value: 'delete', description: 'Delete a space and everything in it', action: 'Delete a space' },
+					{ name: 'Get', value: 'get', description: 'Get a space by ID', action: 'Get a space' },
+					{ name: 'List', value: 'list', description: 'List spaces', action: 'List spaces' },
+					{ name: 'Update', value: 'update', description: 'Rename a space or change its labels', action: 'Update a space' },
 				],
 				default: 'create',
 			},
+			{
+				displayName: 'Space ID',
+				name: 'spaceId',
+				type: 'string',
+				default: '',
+				required: true,
+				displayOptions: { show: { resource: ['space'], operation: ['delete', 'get', 'update'] } },
+				description: 'The ID of the space',
+			},
+			{
+				displayName: 'Name',
+				name: 'name',
+				type: 'string',
+				default: '',
+				required: true,
+				displayOptions: { show: { resource: ['space'], operation: ['create'] } },
+				description: 'Name for the new space. Creation fails if a space with this name already exists.',
+			},
+			{
+				displayName: 'Embedder ID',
+				name: 'embedderId',
+				type: 'string',
+				default: '',
+				required: true,
+				displayOptions: { show: { resource: ['space'], operation: ['create'] } },
+				description: 'ID of the embedder that will index this space. Use Embedder → List to find one.',
+			},
+			...CHUNKING_PROPERTIES('space', 'create'),
+			KEY_VALUE_COLLECTION('Labels', 'labels', 'Labels for the space (at most 20)', {
+				resource: ['space'],
+				operation: ['create'],
+			}),
+			{
+				displayName: 'New Name',
+				name: 'newName',
+				type: 'string',
+				default: '',
+				displayOptions: { show: { resource: ['space'], operation: ['update'] } },
+				description: 'New name for the space. Leave empty to keep the current name.',
+			},
+			{
+				displayName: 'Label Update',
+				name: 'labelMode',
+				type: 'options',
+				noDataExpression: true,
+				default: 'keep',
+				options: [
+					{ name: 'Keep Existing', value: 'keep' },
+					{ name: 'Merge Into Existing', value: 'merge' },
+					{ name: 'Replace All', value: 'replace' },
+				],
+				displayOptions: { show: { resource: ['space'], operation: ['update'] } },
+			},
+			KEY_VALUE_COLLECTION('Labels', 'updateLabels', 'Labels to merge or replace (at most 20)', {
+				resource: ['space'],
+				operation: ['update'],
+				labelMode: ['merge', 'replace'],
+			}),
+			{
+				displayName: 'Name Filter',
+				name: 'nameFilter',
+				type: 'string',
+				default: '',
+				displayOptions: { show: { resource: ['space'], operation: ['list'] } },
+				description: 'Glob filter on space names, e.g. docs-*',
+			},
 
-			/*
-			 * ============================================
-			 *            SPACE FIELDS
-			 * ============================================
-			 */
+			/* ----------------------------------------------------------- memory */
 			{
-				displayName: 'Space ID',
-				name: 'requiredSpaceId',
-				type: 'string',
-				default: '',
-				required: true,
-				displayOptions: {
-					show: {
-						resource: ['space'],
-					},
-					hide: {
-						operation: ['create'],
-					},
-				},
-				placeholder: '',
-				description: 'The Space ID to operate on',
-			},
-			{
-				displayName: 'Space ID',
-				name: 'optionalSpaceId',
-				type: 'string',
-				default: '',
-				displayOptions: {
-					show: {
-						resource: ['space'],
-						operation: ['create'],
-					},
-				},
-				placeholder: '',
-				description: 'Client-provided UUID for idempotent creation',
-				routing: {
-					send: {
-						type: 'body',
-						property: 'spaceId',
-					},
-				},
-			},
-			{
-				displayName: 'Space Name',
-				name: 'requiredSpaceName',
-				type: 'string',
-				default: '',
-				required: true,
-				displayOptions: {
-					show: {
-						resource: ['space'],
-						operation: ['create'],
-					},
-				},
-				placeholder: '',
-				description: 'Name for the new space',
-				routing: {
-					send: {
-						type: 'body',
-						property: 'name',
-					},
-				},
-			},
-			{
-				displayName: 'Embedder(s)',
-				name: 'spaceEmbedders',
-				type: 'fixedCollection',
-				typeOptions: { multipleValues: true },
-				placeholder: 'Add Embedder',
-				default: {},
-				required: true,
-				displayOptions: {
-					show: {
-						resource: ['space'],
-						operation: ['create'],
-					},
-				},
-				description: 'Embedder configurations for the space. At least one is required.',
+				displayName: 'Operation',
+				name: 'operation',
+				type: 'options',
+				noDataExpression: true,
+				displayOptions: { show: { resource: ['memory'] } },
 				options: [
-				{
-					displayName: 'Embedder',
-					name: 'embedders',
-					values: [
-						{
-							displayName: 'Embedder ID',
-							name: 'embedderId',
-							type: 'string',
-							default: '',
-							placeholder: '',
-							description: 'The identifier for the embedder',
-						},
-						{
-							displayName: 'Default Retrieval Weight',
-							name: 'defaultRetrievalWeight',
-							type: 'number',
-							default: 1.0,
-							placeholder: '',
-							description: 'Relative priority when retrieving memories',
-						},
-					]
-				},
-			],
-			routing: {
-				send: {
-					type: 'body',
-					property: 'spaceEmbedders',
-					value: '={{$value.embedders}}',
-				},
-			},
-			},
-			{
-				displayName: 'Space Owner',
-				name: 'optionalSpaceOwner',
-				type: 'string',
-				default: '',
-				displayOptions: {
-					show: {
-						resource: ['space'],
-						operation: ['create'],
-					},
-				},
-				placeholder: '',
-				description: 'Owner identifier. Requires CREATE_SPACE_ANY permission if specified.',
-				routing: {
-					send: {
-						type: 'body',
-						property: 'ownerId',
-					},
-				},
-			},
-			{
-				displayName: 'Labels',
-				name: 'optionalSpaceLabels',
-				type: 'fixedCollection',
-				typeOptions: { multipleValues: true },
-				placeholder: 'Add Label',
-				default: {},
-				displayOptions: {
-					show: {
-						resource: ['space'],
-						operation: ['create'],
-					},
-				},
-				description: 'Key-value pairs for categorizing the space (max 20)',
-				options: [
-				{
-					displayName: 'Label',
-					name: 'labelItems',
-					values: [
-						{
-							displayName: 'Key',
-							name: 'key',
-							type: 'string',
-							default: '',
-							placeholder: 'e.g. environment',
-							description: 'Label key',
-						},
-						{
-							displayName: 'Value',
-							name: 'value',
-							type: 'string',
-							default: '',
-							placeholder: 'e.g. production',
-							description: 'Label value',
-						}
-					]
-				},
-			],
-			routing: {
-				send: {
-					type: 'body',
-					property: 'labels',
-					value: '={{Object.fromEntries(($value.labelItems || []).map(item => [item.key, item.value]))}}',
-				},
-			},
-			},
-			/*
-			 * ============================================
-			 *            MEMORY FIELDS
-			 * ============================================
-			 */
-			{
-				displayName: 'Space ID',
-				name: 'requiredSpaceIdForMemory',
-				type: 'string',
-				default: '',
-				required: true,
-				displayOptions: {
-					show: {
-						resource: ['memory'],
-						operation: ['create'],
-					},
-				},
-				placeholder: '',
-				description: 'Space ID where the memory will be stored (UUID format)',
-				routing: {
-					send: {
-						type: 'body',
-						property: 'spaceId',
-					},
-				},
+					{ name: 'Create', value: 'create', description: 'Store text or a file as a memory', action: 'Create a memory' },
+					{ name: 'Delete', value: 'delete', description: 'Delete a memory', action: 'Delete a memory' },
+					{ name: 'Download Content', value: 'downloadContent', description: 'Download the original content of a memory', action: 'Download memory content' },
+					{ name: 'Get', value: 'get', description: 'Get a memory by ID', action: 'Get a memory' },
+					{ name: 'List', value: 'list', description: 'List the memories in a space', action: 'List memories' },
+					{ name: 'Retrieve', value: 'retrieve', description: 'Search memories semantically', action: 'Retrieve memories' },
+				],
+				default: 'retrieve',
 			},
 			{
 				displayName: 'Memory ID',
-				name: 'memoryIdRequired',
+				name: 'memoryId',
 				type: 'string',
 				default: '',
 				required: true,
-				displayOptions: {
-					show: {
-						resource: ['memory'],
-						operation: ['delete', 'get', 'downloadContent'],
-					},
-				},
-				placeholder: '',
-				description: 'The Memory ID to operate on (UUID format)',
+				displayOptions: { show: { resource: ['memory'], operation: ['delete', 'get', 'downloadContent'] } },
+				description: 'The ID of the memory',
+			},
+			{
+				displayName: 'Space ID',
+				name: 'memorySpaceId',
+				type: 'string',
+				default: '',
+				required: true,
+				displayOptions: { show: { resource: ['memory'], operation: ['create', 'list'] } },
+				description: 'The ID of the space',
 			},
 			{
 				displayName: 'Include Content',
 				name: 'includeContent',
 				type: 'boolean',
 				default: true,
-				displayOptions: {
-					show: {
-						resource: ['memory'],
-						operation: ['get'],
-					},
-				},
-				description: 'Whether to include the original content in the response',
-				routing: {
-					send: {
-						type: 'query',
-						property: 'includeContent',
-					},
-				},
+				displayOptions: { show: { resource: ['memory'], operation: ['get'] } },
+				description: 'Whether to return the stored content. Text arrives as a "content" field; other types as binary data.',
 			},
 			{
-				displayName: 'Include Processing History',
-				name: 'includeProcessingHistory',
-				type: 'boolean',
-				default: false,
-				displayOptions: {
-					show: {
-						resource: ['memory'],
-						operation: ['get'],
-					},
-				},
-				description: 'Whether to include background job processing history in the response',
-				routing: {
-					send: {
-						type: 'query',
-						property: 'includeProcessingHistory',
-					},
-				},
-			},
-			{
-				displayName: 'Memory ID',
-				name: 'memoryIdOptional',
+				displayName: 'Put Output File in Field',
+				name: 'binaryPropertyName',
 				type: 'string',
-				default: '',
-				displayOptions: {
-					show: {
-						resource: ['memory'],
-						operation: ['create'],
-					},
-				},
-				placeholder: '',
-				description: 'Client-provided UUID for idempotent creation',
-				routing: {
-					send: {
-						type: 'body',
-						property: 'memoryId',
-					},
-				},
+				default: 'data',
+				displayOptions: { show: { resource: ['memory'], operation: ['downloadContent', 'get'] } },
+				description: 'Name of the binary property to write non-text content to',
 			},
 			{
-				displayName: 'Content Type',
-				name: 'contentTypeForMemory',
-				type: 'string',
-				default: 'text/plain',
-				displayOptions: {
-					show: {
-						resource: ['memory'],
-						operation: ['create'],
-					},
-				},
-				description: 'MIME type of the content (e.g., text/plain, text/markdown)',
-				routing: {
-					send: {
-						type: 'body',
-						property: 'contentType',
-					},
-				},
+				displayName: 'Input Type',
+				name: 'inputType',
+				type: 'options',
+				noDataExpression: true,
+				default: 'text',
+				options: [
+					{ name: 'Text', value: 'text' },
+					{ name: 'Binary File', value: 'binary' },
+				],
+				displayOptions: { show: { resource: ['memory'], operation: ['create'] } },
 			},
 			{
 				displayName: 'Content',
-				name: 'originalContent',
+				name: 'content',
 				type: 'string',
-				typeOptions: {
-					rows: 5,
-				},
+				typeOptions: { rows: 5 },
 				default: '',
 				required: true,
-				displayOptions: {
-					show: {
-						resource: ['memory'],
-						operation: ['create'],
-					},
-				},
-				placeholder: 'Enter the text content for this memory',
-				description: 'The text content to store as a memory',
-				routing: {
-					send: {
-						type: 'body',
-						property: 'originalContent',
-					},
-				},
-			},
-			/*
-			 * ============================================
-			 *            CHUNKING FIELDS (shared)
-			 * ============================================
-			 */
-			{
-				displayName: 'Chunking Strategy',
-				name: 'optionalChunkingStrategy',
-				type: 'options',
-				default: 'recursive',
-				options: [
-					{
-						name: 'Recursive',
-						value: 'recursive'
-					},
-					{
-						name: 'Sentence',
-						value: 'sentence'
-					},
-					{
-						name: 'None',
-						value: 'none'
-					},
-					{
-						name: 'Other (JSON)',
-						value: 'other'
-					}
-				],
-				displayOptions: {
-					show: {
-						resource: ['space', 'memory'],
-						operation: ['create'],
-					},
-				},
-				placeholder: '',
-				description: 'Strategy for splitting content into chunks',
-				routing: {
-					send: {
-						type: 'body',
-						property: '={{$parameter.resource === "space" ? "defaultChunkingConfig" : "chunkingConfig"}}',
-						value: `={{
-							(() => {
-								const strategy = $parameter.optionalChunkingStrategy;
-
-								// "other" is handled by the JSON field
-								if (strategy === 'other') {
-									return undefined;
-								}
-
-								// "none" has no config options
-								if (strategy === 'none') {
-									return { none: {} };
-								}
-
-								// Map UI values to API enum values
-								const lengthMap = { chars: 'CHARACTER_COUNT', tokens: 'TOKEN_COUNT' };
-								const keepMap = { end: 'KEEP_END', start: 'KEEP_START', none: 'KEEP_NONE' };
-
-								// Check if using default or custom options
-							// Use defaults if toggle is undefined, null, empty, or explicitly 'default'
-								const toggle = $parameter.chunkingOptionToggle;
-								if (!toggle || toggle === 'default') {
-									// A memory with no chunkingConfig inherits its space's default, so
-									// omitting the field is correct there. A space cannot omit it:
-									// POST /v1/spaces rejects a missing defaultChunkingConfig, and an
-									// empty strategy object is stored verbatim as chunkSize 0 rather
-									// than being filled in. So send the documented defaults explicitly.
-									if ($parameter.resource !== 'space') {
-										return undefined;
-									}
-
-									if (strategy === 'sentence') {
-										return {
-											sentence: {
-												maxChunkSize: 4000,
-												minChunkSize: 100,
-												lengthMeasurement: 'CHARACTER_COUNT',
-											}
-										};
-									}
-
-									return {
-										recursive: {
-											chunkSize: 512,
-											chunkOverlap: 64,
-											keepStrategy: 'KEEP_END',
-											lengthMeasurement: 'CHARACTER_COUNT',
-										}
-									};
-								}
-
-								// Build custom config based on strategy
-								if (strategy === 'recursive') {
-									const config = {
-										chunkSize: $parameter.chunkSize,
-										chunkOverlap: $parameter.chunkOverlap,
-										lengthMeasurement: lengthMap[$parameter.lengthUnit] || 'CHARACTER_COUNT',
-									};
-
-									// Add separator config if custom separators selected
-									if ($parameter.chunkingSeparatorOptionToggle === 'custom') {
-										config.separators = $parameter.chunkingSeparators;
-										config.separatorIsRegex = $parameter.chunkingRegexOrString === 'regex';
-										config.keepStrategy = keepMap[$parameter.chunkSeparator] || 'KEEP_END';
-									}
-
-									return { recursive: config };
-								}
-
-								if (strategy === 'sentence') {
-									return {
-										sentence: {
-											maxChunkSize: $parameter.maxChunkSize,
-											minChunkSize: $parameter.minChunkSize,
-											lengthMeasurement: lengthMap[$parameter.lengthUnit] || 'CHARACTER_COUNT',
-										}
-									};
-								}
-
-								return undefined;
-							})()
-						}}`,
-					},
-				},
+				displayOptions: { show: { resource: ['memory'], operation: ['create'], inputType: ['text'] } },
+				description: 'The text to store',
 			},
 			{
-				displayName: 'Chunking Config (JSON)',
-				name: 'chunkingConfigJson',
-				type: 'json',
-				default: '{}',
-				displayOptions: {
-					show: {
-						resource: ['space', 'memory'],
-						operation: ['create'],
-						optionalChunkingStrategy: ['other'],
-					},
-				},
-				placeholder: '{"myStrategy": {"option1": "value1"}}',
-				description: 'Custom chunking config as JSON',
-				routing: {
-					send: {
-						type: 'body',
-						property: '={{$parameter.resource === "space" ? "defaultChunkingConfig" : "chunkingConfig"}}',
-						value: '={{$value ? JSON.parse($value) : undefined}}',
-					},
-				},
-			},
-			{
-				displayName: 'Chunking Options',
-				name: 'chunkingOptionToggle',
-				type: 'options',
-				default: 'default',
-				options: [
-					{
-						name: 'Default',
-						value: 'default',
-					},
-					{
-						name: 'Custom',
-						value: 'custom',
-					},
-				],
-				displayOptions: {
-					show: {
-						resource: ['space', 'memory'],
-						operation: ['create'],
-						optionalChunkingStrategy: ['recursive', 'sentence']
-					},
-				},
-			},
-			{
-				displayName: 'Chunk Size',
-				name: 'chunkSize',
-				type: 'number',
-				typeOptions: {
-					minValue: 1,
-					numberStep: 1,
-				},
-				default: 512,
-				required: true,
-				displayOptions: {
-					show: {
-						resource: ['space', 'memory'],
-						operation: ['create'],
-						chunkingOptionToggle: ['custom'],
-						optionalChunkingStrategy: ['recursive']
-					},
-				},
-				placeholder: 'Enter chunk size',
-				description: 'Chunk size (characters or tokens) (default 512)',
-			},
-			{
-				displayName: 'Max Chunk Size',
-				name: 'maxChunkSize',
-				type: 'number',
-				typeOptions: {
-					minValue: 2,
-					numberStep: 1,
-				},
-				default: 4000,
-				required: true,
-				displayOptions: {
-					show: {
-						resource: ['space', 'memory'],
-						operation: ['create'],
-						chunkingOptionToggle: ['custom'],
-						optionalChunkingStrategy: ['sentence']
-					},
-				},
-				placeholder: 'Enter max chunk size',
-				description: 'Maximum chunk size (characters or tokens) (default 512)',
-			},
-			{
-				displayName: 'Min Chunk Size',
-				name: 'minChunkSize',
-				type: 'number',
-				typeOptions: {
-					minValue: 1,
-					numberStep: 1,
-				},
-				default: 100,
-				required: true,
-				displayOptions: {
-					show: {
-						resource: ['space', 'memory'],
-						operation: ['create'],
-						chunkingOptionToggle: ['custom'],
-						optionalChunkingStrategy: ['sentence']
-					},
-				},
-				placeholder: 'Enter minimum chunk size',
-				description: 'Minimum chunk size (characters or tokens) (default 512)',
-			},
-			{
-				displayName: 'Chunk Overlap',
-				name: 'chunkOverlap',
-				type: 'number',
-				typeOptions: {
-					minValue: 0,
-					numberStep: 1,
-				},
-				default: 64,
-				displayOptions: {
-					show: {
-						resource: ['space', 'memory'],
-						operation: ['create'],
-						chunkingOptionToggle: ['custom'],
-						optionalChunkingStrategy: ['recursive']
-					},
-				},
-				placeholder: 'Enter chunk overlap',
-				description: 'Overlap between chunks (characters or tokens)',
-			},
-			{
-				displayName: 'Chunking Separator Options',
-				name: 'chunkingSeparatorOptionToggle',
-				type: 'options',
-				default: 'default',
-				options: [
-					{
-						name: 'Default',
-						value: 'default',
-					},
-					{
-						name: 'Custom',
-						value: 'custom',
-					},
-				],
-				displayOptions: {
-					show: {
-						resource: ['space', 'memory'],
-						operation: ['create'],
-						chunkingOptionToggle: ['custom'],
-						optionalChunkingStrategy: ['recursive']
-					},
-				},
-			},
-			{
-				displayName: 'Chunking Definition Options',
-				name: 'chunkingRegexOrString',
-				type: 'options',
-				default: 'string',
-				options: [
-					{
-						name: 'String',
-						value: 'string',
-					},
-					{
-						name: 'Regex',
-						value: 'regex',
-					},
-				],
-				displayOptions: {
-					show: {
-						resource: ['space', 'memory'],
-						operation: ['create'],
-						chunkingOptionToggle: ['custom'],
-						optionalChunkingStrategy: ['recursive']
-					},
-				},
-			},
-			{
-				displayName: 'Chunking Separators',
-				name: 'chunkingSeparators',
+				displayName: 'Content Type',
+				name: 'contentType',
 				type: 'string',
-				typeOptions: {multipleValues: true,multipleValueButtonText: "Add separator"},
-				default: [
-					'\\n\\n',
-					'\\n',
-					' ',
-					''
-				],
-				displayOptions: {
-					show: {
-						resource: ['space', 'memory'],
-						operation: ['create'],
-						optionalChunkingStrategy: ['recursive'],
-						chunkingOptionToggle: ['custom'],
-						chunkingSeparatorOptionToggle: ['custom']
-					},
-				},
-				placeholder: 'Enter chunking separator',
-				description: 'Custom separators',
+				default: 'text/plain',
+				displayOptions: { show: { resource: ['memory'], operation: ['create'], inputType: ['text'] } },
+				description: 'MIME type of the text, e.g. text/plain or text/markdown',
 			},
 			{
-				displayName: 'Keep Separator',
-				name: 'chunkSeparator',
-				type: 'options',
-				default: 'end',
-				required: true,
-				options: [
-					{
-						name: 'End',
-						value: 'end'
-					},
-					{
-						name: 'Start',
-						value: 'start'
-					},
-					{
-						name: 'None',
-						value: 'none'
-					},
-				],
-				displayOptions: {
-					show: {
-						resource: ['space', 'memory'],
-						operation: ['create'],
-						chunkingOptionToggle: ['custom'],
-						optionalChunkingStrategy: ['recursive'],
-						chunkingSeparatorOptionToggle: ['custom']
-					},
-				},
-				placeholder: 'Enter desired separator retention option',
-				description: 'Separator retention',
-			},
-			
-			{
-				displayName: 'Length Unit',
-				name: 'lengthUnit',
-				type: 'options',
-				default: 'chars',
-				required: true,
-				options: [
-					{
-						name: 'Chars',
-						value: 'chars'
-					},
-					{
-						name: 'Tokens',
-						value: 'tokens'
-					},
-				],
-				displayOptions: {
-					show: {
-						resource: ['space', 'memory'],
-						operation: ['create'],
-						chunkingOptionToggle: ['custom'],
-						optionalChunkingStrategy: ['recursive', 'sentence'],
-					},
-				},
-				placeholder: 'Enter Length measurement unit',
-				description: 'Length measurement unit',
-			},
-			{
-				displayName: 'Metadata',
-				name: 'optionalMetadata',
-				type: 'fixedCollection',
-				typeOptions: { multipleValues: true },
-				placeholder: 'Add Metadata',
-				default: {},
-				displayOptions: {
-					show: {
-						resource: ['memory'],
-						operation: ['create'],
-					},
-				},
-				description: 'Key-value pairs for memory metadata',
-				options: [
-				{
-					displayName: 'Metadata',
-					name: 'metadata',
-					values: [
-						{
-							displayName: 'Key',
-							name: 'key',
-							type: 'string',
-							default: '',
-							placeholder: 'e.g. source',
-							description: 'Metadata key',
-						},
-						{
-							displayName: 'Value',
-							name: 'value',
-							type: 'string',
-							default: '',
-							placeholder: 'e.g. email',
-							description: 'Metadata value',
-						}
-					]
-				},
-			],
-			routing: {
-				send: {
-					type: 'body',
-					property: 'metadata',
-					value: '={{Object.fromEntries(($value.metadata || []).map(item => [item.key, item.value]))}}',
-				},
-			},
-		},
-			/*
-			 * ============================================
-			 *            RETRIEVE FIELDS
-			 * ============================================
-			 */
-			{
-				displayName: 'Message',
-				name: 'retrieveMessage',
+				displayName: 'Input Binary Field',
+				name: 'inputBinaryPropertyName',
 				type: 'string',
-				typeOptions: {
-					rows: 3,
-				},
+				default: 'data',
+				required: true,
+				displayOptions: { show: { resource: ['memory'], operation: ['create'], inputType: ['binary'] } },
+				description: 'Name of the binary property holding the file to store',
+			},
+			KEY_VALUE_COLLECTION('Metadata', 'metadata', 'Metadata stored with the memory. A "title" key helps some embedders.', {
+				resource: ['memory'],
+				operation: ['create'],
+			}),
+			...CHUNKING_PROPERTIES('memory', 'create'),
+			{
+				displayName: 'Wait for Indexing',
+				name: 'wait',
+				type: 'boolean',
+				default: true,
+				displayOptions: { show: { resource: ['memory'], operation: ['create'] } },
+				description:
+					'Whether to wait until the memory is indexed and searchable before continuing. Turn off to return immediately with status PENDING.',
+			},
+			{
+				displayName: 'Indexing Timeout (Seconds)',
+				name: 'waitTimeout',
+				type: 'number',
+				default: 120,
+				typeOptions: { minValue: 1 },
+				displayOptions: { show: { resource: ['memory'], operation: ['create'], wait: [true] } },
+			},
+			{
+				displayName: 'Status Filter',
+				name: 'statusFilter',
+				type: 'options',
+				default: '',
+				options: [
+					{ name: 'Any', value: '' },
+					{ name: 'Completed', value: 'COMPLETED' },
+					{ name: 'Failed', value: 'FAILED' },
+					{ name: 'Pending', value: 'PENDING' },
+					{ name: 'Processing', value: 'PROCESSING' },
+				],
+				displayOptions: { show: { resource: ['memory'], operation: ['list'] } },
+			},
+
+			/* --------------------------------------------------------- retrieve */
+			{
+				displayName: 'Query',
+				name: 'query',
+				type: 'string',
+				typeOptions: { rows: 3 },
 				default: '',
 				required: true,
-				displayOptions: {
-					show: {
-						resource: ['memory'],
-						operation: ['retrieve'],
-					},
-				},
-				placeholder: 'Enter your search query',
-				description: 'Primary query/message for semantic search',
-				routing: {
-					send: {
-						type: 'query',
-						property: 'message',
-					},
-				},
+				displayOptions: { show: { resource: ['memory'], operation: ['retrieve'] } },
+				description: 'What to search for, in natural language',
 			},
 			{
 				displayName: 'Space IDs',
-				name: 'retrieveSpaceIds',
+				name: 'spaceIds',
 				type: 'string',
-				typeOptions: {
-					multipleValues: true,
-					multipleValueButtonText: 'Add Space ID',
-				},
+				typeOptions: { multipleValues: true, multipleValueButtonText: 'Add Space ID' },
 				default: [],
 				required: true,
-				displayOptions: {
-					show: {
-						resource: ['memory'],
-						operation: ['retrieve'],
-					},
-				},
-				placeholder: 'Enter Space UUID',
-				description: 'Space UUIDs to search within. At least one is required.',
-				routing: {
-					send: {
-						type: 'query',
-						property: 'spaceIds',
-						value: '={{$value.join(",")}}',
-					},
-				},
+				displayOptions: { show: { resource: ['memory'], operation: ['retrieve'] } },
+				description: 'Spaces to search. At least one is required.',
+			},
+			{
+				displayName: 'Limit',
+				name: 'limit',
+				type: 'number',
+				typeOptions: { minValue: 1 },
+				default: 50,
+				displayOptions: { show: { resource: ['memory'], operation: ['retrieve'] } },
+				description: 'Max number of results to return',
 			},
 			{
 				displayName: 'Filter',
-				name: 'retrieveFilter',
+				name: 'filter',
 				type: 'string',
-				typeOptions: {
-					rows: 2,
-				},
 				default: '',
-				displayOptions: {
-					show: {
-						resource: ['memory'],
-						operation: ['retrieve'],
-					},
-				},
-				placeholder: "e.g. val('$.key1') = 'value1'",
-				description: 'Filter expression applied to every space ID supplied',
-				routing: {
-					send: {
-						type: 'query',
-						property: 'filter',
-						value: '={{$value || undefined}}',
-					},
-				},
+				displayOptions: { show: { resource: ['memory'], operation: ['retrieve'] } },
+				placeholder: "CAST(val('$.category') AS TEXT) = 'policy'",
+				description:
+					"GoodMem filter expression applied to every space. Inside a quoted value escape ' as \\' and \\ as \\\\; SQL-style '' doubling is rejected by the server.",
 			},
 			{
-				displayName: 'Requested Size',
-				name: 'retrieveRequestedSize',
-				type: 'number',
-				typeOptions: {
-					minValue: 1,
-				},
-				default: 10,
-				displayOptions: {
-					show: {
-						resource: ['memory'],
-						operation: ['retrieve'],
-					},
-				},
-				description: 'Maximum number of memories to retrieve',
-				routing: {
-					send: {
-						type: 'query',
-						property: 'requestedSize',
-					},
-				},
-			},
-			{
-				displayName: 'Fetch Memory',
-				name: 'retrieveFetchMemory',
-				type: 'boolean',
-				default: true,
-				displayOptions: {
-					show: {
-						resource: ['memory'],
-						operation: ['retrieve'],
-					},
-				},
-				description: 'Whether to fetch memory definitions',
-				routing: {
-					send: {
-						type: 'query',
-						property: 'fetchMemory',
-					},
-				},
-			},
-			{
-				displayName: 'Fetch Memory Content',
-				name: 'retrieveFetchMemoryContent',
-				type: 'boolean',
-				default: false,
-				displayOptions: {
-					show: {
-						resource: ['memory'],
-						operation: ['retrieve'],
-					},
-				},
-				description: 'Whether to fetch original content for memories',
-				routing: {
-					send: {
-						type: 'query',
-						property: 'fetchMemoryContent',
-					},
-				},
-			},
-			{
-				displayName: 'Post-Processor Options',
-				name: 'postProcessorOptions',
+				displayName: 'Options',
+				name: 'retrieveOptions',
 				type: 'collection',
-				placeholder: 'Add Post-Processor Option',
+				placeholder: 'Add Option',
 				default: {},
-				displayOptions: {
-					show: {
-						resource: ['memory'],
-						operation: ['retrieve'],
-					},
-				},
-				description: 'Configure ChatPostProcessor for reranking and LLM generation',
+				displayOptions: { show: { resource: ['memory'], operation: ['retrieve'] } },
 				options: [
 					{
 						displayName: 'Chronological Resort',
-						name: 'postProcessorChronologicalResort',
+						name: 'chronologicalResort',
+						type: 'boolean',
+						default: false,
+						description: 'Whether to order results by creation time instead of relevance. Requires a reranker.',
+					},
+					{
+						displayName: 'Fetch Candidates',
+						name: 'fetchK',
+						type: 'number',
+						typeOptions: { minValue: 1 },
+						default: 0,
+						description: 'Candidates to retrieve before reranking. 0 uses Limit.',
+					},
+					{
+						displayName: 'Include Abstract Reply',
+						name: 'includeAbstractReply',
 						type: 'boolean',
 						default: true,
-						description: 'Whether to resort results by creation time (default: true)',
-						routing: {
-							send: {
-								type: 'query',
-								property: 'postProcessorChronologicalResort',
-							},
-						},
+						description: 'Whether to include the LLM-generated answer (when an LLM is set) on the first item',
 					},
 					{
 						displayName: 'LLM ID',
-						name: 'postProcessorLlmId',
+						name: 'llmId',
 						type: 'string',
 						default: '',
-						placeholder: 'UUID of LLM',
-						description: 'UUID of LLM for ChatPostProcessor generation',
-						routing: {
-							send: {
-								type: 'query',
-								property: 'postProcessorLlmId',
-							},
-						},
+						description: 'LLM to generate an answer from the retrieved passages',
 					},
 					{
 						displayName: 'LLM Temperature',
-						name: 'postProcessorLlmTemp',
+						name: 'llmTemp',
 						type: 'number',
-						typeOptions: {
-							minValue: 0,
-							maxValue: 2,
-							numberPrecision: 2,
-						},
+						typeOptions: { minValue: 0, maxValue: 2, numberPrecision: 2 },
 						default: 0.3,
-						description: 'LLM temperature for ChatPostProcessor (default: 0.3)',
-						routing: {
-							send: {
-								type: 'query',
-								property: 'postProcessorLlmTemp',
-							},
-						},
-					},
-					{
-						displayName: 'Max Results',
-						name: 'postProcessorMaxResults',
-						type: 'number',
-						typeOptions: {
-							minValue: 1,
-						},
-						default: 10,
-						description: 'Maximum results for ChatPostProcessor (default: 10)',
-						routing: {
-							send: {
-								type: 'query',
-								property: 'postProcessorMaxResults',
-							},
-						},
 					},
 					{
 						displayName: 'Relevance Threshold',
-						name: 'postProcessorRelevanceThreshold',
+						name: 'relevanceThreshold',
 						type: 'number',
-						typeOptions: {
-							minValue: 0,
-							maxValue: 1,
-							numberPrecision: 2,
-						},
-						default: 0.5,
-						description: 'Minimum relevance score for ChatPostProcessor (default: 0.5)',
-						routing: {
-							send: {
-								type: 'query',
-								property: 'postProcessorRelevanceThreshold',
-							},
-						},
+						typeOptions: { numberPrecision: 3 },
+						default: 0,
+						description:
+							'Minimum reranker score to keep a result. Only meaningful with a reranker; the score range depends on the reranker model. Ignored when 0.',
 					},
 					{
 						displayName: 'Reranker ID',
-						name: 'postProcessorRerankerId',
+						name: 'rerankerId',
 						type: 'string',
 						default: '',
-						placeholder: 'UUID of reranker',
-						description: 'UUID of reranker for ChatPostProcessor (enables post-processing)',
-						routing: {
-							send: {
-								type: 'query',
-								property: 'postProcessorRerankerId',
-							},
-						},
+						description: 'Reranker to improve result ordering. Use Reranker → List to find one.',
 					},
 				],
 			},
-			// ...issueDescription,
-			// ...issueCommentDescription,
+
+			/* -------------------------------------------------- list (shared) */
+			{
+				displayName: 'Max Items',
+				name: 'maxItems',
+				type: 'number',
+				typeOptions: { minValue: 1 },
+				default: 100,
+				displayOptions: {
+					show: { operation: ['list'] },
+				},
+				description: 'Stop after this many items. Pages are followed automatically.',
+			},
 		],
 	};
 
-	// methods = {
-	// 	listSearch: {
-	// 		getRepositories,
-	// 		getUsers,
-	// 		getIssues,
-	// 	},
-	// };
+	async execute(this: IExecuteFunctions): Promise<INodeExecutionData[][]> {
+		const items = this.getInputData();
+		const returnData: INodeExecutionData[] = [];
+		const resource = this.getNodeParameter('resource', 0) as string;
+		const operation = this.getNodeParameter('operation', 0) as string;
+
+		for (let i = 0; i < items.length; i++) {
+			try {
+				const out = await runOperation.call(this, resource, operation, i);
+				for (const item of out) item.pairedItem = { item: i };
+				returnData.push(...out);
+			} catch (error) {
+				if (this.continueOnFail()) {
+					returnData.push({
+						json: { error: (error as Error).message },
+						pairedItem: { item: i },
+					});
+					continue;
+				}
+				// Re-wrapping a NodeApiError hands back the original with the
+				// server's message intact; anything else becomes a node error.
+				if (error instanceof NodeApiError) {
+					throw new NodeApiError(this.getNode(), error as unknown as JsonObject, { itemIndex: i });
+				}
+				throw new NodeOperationError(this.getNode(), error as Error, { itemIndex: i });
+			}
+		}
+		return [returnData];
+	}
+}
+
+async function runOperation(
+	this: IExecuteFunctions,
+	resource: string,
+	operation: string,
+	i: number,
+): Promise<INodeExecutionData[]> {
+	const one = (json: IDataObject, binary?: INodeExecutionData['binary']): INodeExecutionData[] => [
+		binary ? { json, binary } : { json },
+	];
+	const many = (list: IDataObject[]): INodeExecutionData[] => list.map((json) => ({ json }));
+
+	/* ---------------------------------------------------------------- lists */
+	if (operation === 'list' && (resource === 'embedder' || resource === 'reranker')) {
+		const maxItems = this.getNodeParameter('maxItems', i, 100) as number;
+		const { items, truncated } = await listAll.call(
+			this,
+			resource === 'embedder' ? '/embedders' : '/rerankers',
+			resource === 'embedder' ? 'embedders' : 'rerankers',
+			{ maxItems, itemIndex: i },
+		);
+		return many(items.map((entry) => ({ ...(entry as IDataObject), truncated })));
+	}
+
+	/* ---------------------------------------------------------------- space */
+	if (resource === 'space') {
+		if (operation === 'list') {
+			const maxItems = this.getNodeParameter('maxItems', i, 100) as number;
+			const nameFilter = (this.getNodeParameter('nameFilter', i, '') as string).trim();
+			const { items, truncated } = await listAll.call(this, '/spaces', 'spaces', {
+				maxItems,
+				itemIndex: i,
+				qs: nameFilter ? { nameFilter } : {},
+			});
+			return many(items.map((entry) => ({ ...(entry as IDataObject), truncated })));
+		}
+		if (operation === 'create') {
+			const body: IDataObject = {
+				name: this.getNodeParameter('name', i) as string,
+				spaceEmbedders: [{ embedderId: this.getNodeParameter('embedderId', i) as string }],
+			};
+			const labels = collectionToObject(this.getNodeParameter('labels', i, {}));
+			if (Object.keys(labels).length) body.labels = labels;
+			const chunking = this.getNodeParameter('chunking', i, 'default') as string;
+			if (chunking === 'none') body.defaultChunkingConfig = { none: {} };
+			else if (chunking === 'custom') {
+				body.defaultChunkingConfig = parseJsonParameter.call(
+					this,
+					this.getNodeParameter('chunkingConfigJson', i),
+					'Chunking Config',
+					i,
+				);
+			}
+			// Server default chunking otherwise: POST /spaces rejects a missing
+			// defaultChunkingConfig, so the documented default is sent explicitly.
+			if (!body.defaultChunkingConfig) {
+				body.defaultChunkingConfig = { recursive: { chunkSize: 512, chunkOverlap: 64 } };
+			}
+			const { body: space } = await goodmemRequest.call(this, { method: 'POST', path: '/spaces', body, itemIndex: i });
+			return one(space as IDataObject);
+		}
+		const spaceId = this.getNodeParameter('spaceId', i) as string;
+		const path = `/spaces/${encodeURIComponent(spaceId)}`;
+		if (operation === 'get') {
+			const { body } = await goodmemRequest.call(this, { method: 'GET', path, itemIndex: i });
+			return one(body as IDataObject);
+		}
+		if (operation === 'delete') {
+			await goodmemRequest.call(this, { method: 'DELETE', path, itemIndex: i });
+			return one({ deleted: true, spaceId });
+		}
+		if (operation === 'update') {
+			const body: IDataObject = {};
+			const newName = (this.getNodeParameter('newName', i, '') as string).trim();
+			if (newName) body.name = newName;
+			const labelMode = this.getNodeParameter('labelMode', i, 'keep') as string;
+			if (labelMode !== 'keep') {
+				const labels = collectionToObject(this.getNodeParameter('updateLabels', i, {}));
+				body[labelMode === 'merge' ? 'mergeLabels' : 'replaceLabels'] = labels;
+			}
+			if (!Object.keys(body).length) {
+				throw new NodeOperationError(this.getNode(), 'Nothing to update: set a new name or a label change.', { itemIndex: i });
+			}
+			const { body: space } = await goodmemRequest.call(this, { method: 'PUT', path, body, itemIndex: i });
+			return one(space as IDataObject);
+		}
+	}
+
+	/* --------------------------------------------------------------- memory */
+	if (resource === 'memory') {
+		if (operation === 'retrieve') return retrieve.call(this, i);
+
+		if (operation === 'list') {
+			const spaceId = this.getNodeParameter('memorySpaceId', i) as string;
+			const maxItems = this.getNodeParameter('maxItems', i, 100) as number;
+			const statusFilter = this.getNodeParameter('statusFilter', i, '') as string;
+			const { items, truncated } = await listAll.call(
+				this,
+				`/spaces/${encodeURIComponent(spaceId)}/memories`,
+				'memories',
+				{ maxItems, itemIndex: i, qs: statusFilter ? { statusFilter } : {} },
+			);
+			return many(items.map((entry) => ({ ...(entry as IDataObject), truncated })));
+		}
+
+		if (operation === 'create') {
+			const spaceId = this.getNodeParameter('memorySpaceId', i) as string;
+			const body: IDataObject = { spaceId };
+			const inputType = this.getNodeParameter('inputType', i, 'text') as string;
+			if (inputType === 'binary') {
+				const property = this.getNodeParameter('inputBinaryPropertyName', i) as string;
+				const binary = this.helpers.assertBinaryData(i, property);
+				const buffer = await this.helpers.getBinaryDataBuffer(i, property);
+				body.contentType = binary.mimeType || 'application/octet-stream';
+				body.originalContentB64 = buffer.toString('base64');
+				const metadata = collectionToObject(this.getNodeParameter('metadata', i, {}));
+				if (binary.fileName && metadata.title === undefined) metadata.title = binary.fileName;
+				if (Object.keys(metadata).length) body.metadata = metadata;
+			} else {
+				const content = this.getNodeParameter('content', i) as string;
+				if (!content.trim()) {
+					throw new NodeOperationError(this.getNode(), 'Content must not be empty.', { itemIndex: i });
+				}
+				body.originalContent = content;
+				body.contentType = (this.getNodeParameter('contentType', i, 'text/plain') as string) || 'text/plain';
+				const metadata = collectionToObject(this.getNodeParameter('metadata', i, {}));
+				if (Object.keys(metadata).length) body.metadata = metadata;
+			}
+			const chunking = this.getNodeParameter('chunking', i, 'default') as string;
+			if (chunking === 'none') body.chunkingConfig = { none: {} };
+			else if (chunking === 'custom') {
+				body.chunkingConfig = parseJsonParameter.call(this, this.getNodeParameter('chunkingConfigJson', i), 'Chunking Config', i);
+			}
+			const { body: created } = await goodmemRequest.call(this, { method: 'POST', path: '/memories', body, itemIndex: i });
+			const memory = created as IDataObject;
+			if (this.getNodeParameter('wait', i, true) as boolean) {
+				const timeout = this.getNodeParameter('waitTimeout', i, 120) as number;
+				memory.processingStatus = await waitForMemory.call(this, String(memory.memoryId), {
+					timeoutMs: timeout * 1000,
+					itemIndex: i,
+				});
+			}
+			return one(memory);
+		}
+
+		const memoryId = this.getNodeParameter('memoryId', i) as string;
+		const path = `/memories/${encodeURIComponent(memoryId)}`;
+
+		if (operation === 'delete') {
+			await goodmemRequest.call(this, { method: 'DELETE', path, itemIndex: i });
+			return one({ deleted: true, memoryId });
+		}
+
+		if (operation === 'get') {
+			const includeContent = this.getNodeParameter('includeContent', i, true) as boolean;
+			const { body } = await goodmemRequest.call(this, {
+				method: 'GET',
+				path,
+				qs: includeContent ? { includeContent: 'true' } : {},
+				itemIndex: i,
+			});
+			const memory = { ...(body as IDataObject) };
+			const encoded = memory.originalContent;
+			delete memory.originalContent;
+			if (includeContent && typeof encoded === 'string') {
+				// The server sends content base64-encoded inside the JSON.
+				const buffer = Buffer.from(encoded, 'base64');
+				const contentType = String(memory.contentType ?? 'application/octet-stream');
+				return emitContent.call(this, memory, buffer, contentType, memoryId, i);
+			}
+			return one(memory);
+		}
+
+		if (operation === 'downloadContent') {
+			const { body: meta } = await goodmemRequest.call(this, { method: 'GET', path, itemIndex: i });
+			const { body, headers } = (await goodmemRequest.call(this, {
+				method: 'GET',
+				path: `${path}/content`,
+				encoding: 'arraybuffer',
+				itemIndex: i,
+			})) as GoodmemResponse<Buffer>;
+			const memory = meta as IDataObject;
+			const contentType = headers['content-type'] || String(memory.contentType ?? 'application/octet-stream');
+			return emitContent.call(this, memory, body, contentType, memoryId, i);
+		}
+	}
+
+	throw new NodeOperationError(this.getNode(), `Unsupported operation "${resource}:${operation}".`, { itemIndex: i });
+}
+
+/** Text content becomes a readable field; anything else becomes n8n binary data. */
+async function emitContent(
+	this: IExecuteFunctions,
+	memory: IDataObject,
+	buffer: Buffer,
+	contentType: string,
+	memoryId: string,
+	i: number,
+): Promise<INodeExecutionData[]> {
+	const json: IDataObject = { ...memory, contentType, contentLength: buffer.length };
+	if (isTextual(contentType)) {
+		const decoded = decodeText(buffer, contentType);
+		if (decoded?.text !== undefined) {
+			json.content = decoded.text;
+			return [{ json }];
+		}
+		// Undecodable text is handed over as bytes with the reason attached.
+		if (decoded?.error) json.contentError = decoded.error;
+	}
+	const property = this.getNodeParameter('binaryPropertyName', i, 'data') as string;
+	const fileName = fileNameFor(memory, memoryId, contentType);
+	const binary = await this.helpers.prepareBinaryData(buffer, fileName, contentType.split(';')[0].trim());
+	return [{ json, binary: { [property]: binary } }];
+}
+
+async function retrieve(this: IExecuteFunctions, i: number): Promise<INodeExecutionData[]> {
+	const query = (this.getNodeParameter('query', i) as string).trim();
+	if (!query) throw new NodeOperationError(this.getNode(), 'Query must not be empty.', { itemIndex: i });
+	const spaceIds = (this.getNodeParameter('spaceIds', i) as string[]).map((s) => s.trim()).filter(Boolean);
+	if (!spaceIds.length) throw new NodeOperationError(this.getNode(), 'At least one Space ID is required.', { itemIndex: i });
+	const limit = this.getNodeParameter('limit', i, 10) as number;
+	const filter = (this.getNodeParameter('filter', i, '') as string).trim();
+	const options = this.getNodeParameter('retrieveOptions', i, {}) as IDataObject;
+	const rerankerId = String(options.rerankerId ?? '').trim();
+	const llmId = String(options.llmId ?? '').trim();
+	const fetchK = Number(options.fetchK ?? 0) || 0;
+	const relevanceThreshold = Number(options.relevanceThreshold ?? 0) || 0;
+
+	if (relevanceThreshold && !rerankerId) {
+		throw new NodeOperationError(
+			this.getNode(),
+			'Relevance Threshold needs a Reranker ID: vector scores are not on a fixed scale.',
+			{ itemIndex: i },
+		);
+	}
+
+	const body: IDataObject = {
+		message: query,
+		spaceKeys: spaceIds.map((spaceId) => (filter ? { spaceId, filter } : { spaceId })),
+		requestedSize: fetchK > 0 ? Math.max(fetchK, limit) : limit,
+		fetchMemory: true,
+	};
+	if (rerankerId || llmId) {
+		const config: IDataObject = { max_results: limit };
+		if (rerankerId) config.reranker_id = rerankerId;
+		if (llmId) {
+			config.llm_id = llmId;
+			config.llm_temp = Number(options.llmTemp ?? 0.3);
+		}
+		if (relevanceThreshold) config.relevance_threshold = relevanceThreshold;
+		if (options.chronologicalResort === true) config.chronological_resort = true;
+		body.postProcessor = { name: 'com.goodmem.retrieval.postprocess.ChatPostProcessorFactory', config };
+	}
+
+	const { body: text } = (await goodmemRequest.call(this, {
+		method: 'POST',
+		path: '/memories:retrieve',
+		body,
+		encoding: 'text',
+		accept: 'application/x-ndjson',
+		itemIndex: i,
+	})) as GoodmemResponse<string>;
+
+	const parsed = parseNdjson(typeof text === 'string' ? text : String(text ?? ''));
+	const { statuses, degraded } = classify(parsed);
+	const hits = hitsFromEvents(parsed.events, Boolean(rerankerId)).slice(0, limit);
+
+	// A search that failed outright must not look like one that found nothing.
+	if (degraded && hits.length === 0) {
+		const summary = statuses.map((s) => `${String(s.code)}: ${String(s.message ?? '')}`).join('; ');
+		throw new NodeOperationError(this.getNode(), `Retrieval failed: ${summary}`, {
+			itemIndex: i,
+			description: JSON.stringify(statuses),
+		});
+	}
+
+	const reply = options.includeAbstractReply !== false ? abstractReply(parsed.events) : undefined;
+	return hits.map((hit, index) => {
+		const json: IDataObject = {
+			...hit,
+			query,
+			// True when part of the search did not complete: results are
+			// usable but may be incomplete. The statuses say why.
+			partial: degraded,
+			statuses,
+		};
+		if (index === 0 && reply) json.abstractReply = reply;
+		return { json };
+	});
 }
