@@ -36,4 +36,5 @@ jobs:
         run: 'npm run build'
 
       - name: Run tests
-        run: 'node --test test/'
+        # A glob, not a directory: Node 22+ no longer expands a directory argument.
+        run: node --test "test/**/*.test.js"

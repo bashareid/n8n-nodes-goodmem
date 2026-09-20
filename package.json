@@ -23,7 +23,7 @@
         "lint:fix": "n8n-node lint --fix",
         "release": "n8n-node release",
         "prepublishOnly": "n8n-node prerelease",
-        "test": "npm run build && node --test test/"
+        "test": "npm run build && node --test \"test/**/*.test.js\""
     },
     "files": [
         "dist"
