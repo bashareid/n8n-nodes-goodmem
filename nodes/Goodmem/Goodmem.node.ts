@@ -772,13 +772,20 @@ async function retrieve(this: IExecuteFunctions, i: number): Promise<INodeExecut
 	const { statuses, degraded } = classify(parsed);
 	const hits = hitsFromEvents(parsed.events, Boolean(rerankerId)).slice(0, limit);
 
-	// A search that failed outright must not look like one that found nothing.
 	if (degraded && hits.length === 0) {
+		// Retrieval status contract, Q4b: a search that failed outright returns
+		// no items rather than failing the node. Zero items have nowhere to
+		// carry a flag, so the failure is surfaced as an execution hint (shown
+		// in the output pane) and a warning log line, both with the server's
+		// statuses, so it is distinguishable from "no matches".
 		const summary = statuses.map((s) => `${String(s.code)}: ${String(s.message ?? '')}`).join('; ');
-		throw new NodeOperationError(this.getNode(), `Retrieval failed: ${summary}`, {
-			itemIndex: i,
-			description: JSON.stringify(statuses),
+		this.addExecutionHints({
+			message: `Retrieval returned no results and GoodMem reported a problem: ${summary}`,
+			type: 'warning',
+			location: 'outputPane',
 		});
+		this.logger.warn(`GoodMem retrieval failed with no results: ${summary}`, { statuses });
+		return [];
 	}
 
 	const reply = options.includeAbstractReply !== false ? abstractReply(parsed.events) : undefined;

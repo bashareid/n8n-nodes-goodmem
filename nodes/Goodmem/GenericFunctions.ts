@@ -285,15 +285,18 @@ export function parseNdjson(text: string): ParsedStream {
 	return { events, malformedLines };
 }
 
-/** Notices that carry no loss of results. */
+/**
+ * Notices that carry no loss of results.
+ *
+ * FEATURE_DISABLED is informational by its code alone. The server defines it
+ * as "feature disabled due to missing configuration" (common.proto, under
+ * "Informational status messages (non-error)"): the caller did not configure
+ * an optional feature, so nothing the caller asked for is missing. A feature
+ * that was requested and could not be delivered arrives as a different code
+ * (NOT_FOUND, RERANKING_FAILED, ...). Retrieval status contract, Q1.
+ */
 export function isInformational(status: GoodmemStatus): boolean {
-	if (!status.code) return false;
-	if (status.code === 'LLM_CAPABILITY_INFERRED') return true;
-	if (status.code === 'FEATURE_DISABLED') {
-		const details = status.details ?? {};
-		return details.feature === 'summarization' && details.required_param === 'llm_id';
-	}
-	return false;
+	return status.code === 'LLM_CAPABILITY_INFERRED' || status.code === 'FEATURE_DISABLED';
 }
 
 export interface Classified {

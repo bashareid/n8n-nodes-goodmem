@@ -54,7 +54,9 @@ output item:
 - `partial` is `true` when part of the search did not complete — a reranker was
   unavailable, one space was unreachable. The passages are usable but may be
   incomplete, and `statuses` says why. A search that produced nothing usable
-  fails the node with the server's reason; an empty result is simply no items.
+  returns no items — never a node failure — and surfaces the server's reason
+  as an execution hint in the output pane and a warning in the log, so it is
+  distinguishable from a search that simply matched nothing.
 - `score` is passed through exactly as GoodMem reports it. Vector scores are
   opaque similarities that can be negative; reranker scores are relevance
   values. `scoreKind` says which you have. **Relevance Threshold** therefore

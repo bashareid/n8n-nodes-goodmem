@@ -119,9 +119,19 @@ async function runNode(server, params, options = {}) {
 		return opts.returnFullResponse ? { statusCode: res.status, headers: responseHeaders, body: parsed } : parsed;
 	};
 
+	const hints = options.hints ?? [];
+	const logs = options.logs ?? [];
 	const ctx = {
 		getInputData: () => items,
 		getNode: () => node,
+		// Zero-item outputs carry their flag here (retrieval status contract, Q4b).
+		addExecutionHints: (...h) => hints.push(...h),
+		logger: {
+			warn: (message, meta) => logs.push({ level: 'warn', message, meta }),
+			info: () => {},
+			error: () => {},
+			debug: () => {},
+		},
 		continueOnFail: () => Boolean(options.continueOnFail),
 		getCredentials: async () => ({ server: server.baseUrl, goodmemApiKey: 'test-key' }),
 		getNodeParameter: (name, _i, fallback) => (name in params ? params[name] : fallback),

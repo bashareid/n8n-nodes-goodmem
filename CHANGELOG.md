@@ -23,9 +23,11 @@ are kept alongside the repository's audit notes.
 - **A search whose reranking failed reported success.** The server's
   `NOT_FOUND` and `RERANKING_FAILED` statuses were inside that string. They now
   mark the results `partial` and are listed in `statuses`; a search that
-  produced nothing usable fails the node with the server's reason. Notices that
-  carry no loss (the "no LLM configured" notice) are dropped; status codes this
-  version does not know are reported as `UNKNOWN` and never discard results.
+  produced nothing usable returns no items and surfaces the server's reason as
+  an execution hint and a warning log line, never a node failure. Notices that
+  carry no loss (`FEATURE_DISABLED`, `LLM_CAPABILITY_INFERRED`) are dropped by
+  code alone, per the server's definition of them; status codes this version
+  does not know are reported as `UNKNOWN` and never discard results.
 - **Download Content corrupted binary.** Bytes were decoded as text: a 196-byte
   PDF payload came back with 132 replacement characters and no binary property.
   Non-text content is now delivered as n8n binary data, byte for byte; text

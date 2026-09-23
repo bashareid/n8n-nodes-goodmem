@@ -112,9 +112,24 @@ describe('Goodmem node execute()', () => {
 		assert.equal(server.requests[0].json.postProcessor.config.reranker_id, 'r-missing');
 	});
 
-	it('raises when a search failed outright with nothing usable', async () => {
+	it('returns no items and flags a search that failed outright (contract Q4b)', async () => {
 		server.route('POST', ':retrieve', () => ndjson(status('VECTOR_SEARCH_FAILED', 'backend unavailable')));
-		await assert.rejects(runNode(server, retrieveParams()), /Retrieval failed: VECTOR_SEARCH_FAILED/);
+		const hints = [];
+		const logs = [];
+		const items = await runNode(server, retrieveParams(), { hints, logs });
+		assert.deepEqual(items, [], 'a failed search is empty, not a node failure');
+		assert.equal(hints.length, 1, 'the failure is surfaced as an execution hint');
+		assert.match(hints[0].message, /VECTOR_SEARCH_FAILED/);
+		assert.equal(hints[0].type, 'warning');
+		assert.equal(logs.length, 1);
+		assert.equal(logs[0].meta.statuses[0].code, 'VECTOR_SEARCH_FAILED');
+	});
+
+	it('treats FEATURE_DISABLED as informational whatever its details (contract Q1)', () => {
+		const event = { status: { code: 'FEATURE_DISABLED', message: 'Reranking disabled: no reranker configured.', details: { feature: 'reranking', required_param: 'reranker_id' } } };
+		const { statuses, degraded } = classify({ events: [event], malformedLines: 0 });
+		assert.equal(degraded, false);
+		assert.deepEqual(statuses, []);
 	});
 
 	it('keeps chunks when a newer server sends an unknown status code', async () => {
