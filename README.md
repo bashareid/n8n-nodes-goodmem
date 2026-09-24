@@ -58,9 +58,11 @@ output item:
   as an execution hint in the output pane and a warning in the log, so it is
   distinguishable from a search that simply matched nothing.
 - `score` is passed through exactly as GoodMem reports it. Vector scores are
-  opaque similarities that can be negative; reranker scores are relevance
-  values. `scoreKind` says which you have. **Relevance Threshold** therefore
-  needs a Reranker ID.
+  opaque similarities that can be negative; reranker scores are on a scale
+  that depends on the reranker model (Voyage `rerank-2.5` ~`0.27..0.93`, Jina
+  `jina-reranker-v3` ~`-0.14..0.43` on the same documents). `scoreKind` says
+  which you have. **Relevance Threshold** therefore needs a Reranker ID and
+  must be calibrated for the reranker in use — it is not a 0–1 value.
 - **Filter** is a GoodMem expression applied to every space, e.g.
   `CAST(val('$.category') AS TEXT) = 'policy'`. Inside a quoted value escape
   `'` as `\'` and `\` as `\\`.
