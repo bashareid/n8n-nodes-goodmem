@@ -23,10 +23,14 @@ are kept alongside the repository's audit notes.
   including the space ID of Memory → List and the ID polled after Create — must
   now be a UUID. Anything else is refused with an error naming the field and
   the item before any request is made. Percent-encoding is kept but no longer
-  relied on: on its own it still sent `DELETE /v1/spaces/..%2Fspaces%2F<id>`,
-  or `DELETE /v1/spaces/` for an empty ID, and reported success for whatever
-  the server or a proxy made of it. IDs are taken exactly as given, not
-  trimmed; blank entries in Space IDs are still ignored.
+  relied on. On its own it leaves `.` and `..` as they are, and the HTTP client
+  resolves them: Space → Delete with Space ID `..` sent `DELETE /v1/` and
+  answered `{"deleted": true}`, and Memory → List with Space ID `..` sent
+  `GET /v1/memories`. Other values went out encoded, such as
+  `DELETE /v1/spaces/..%2Fspaces%2F<id>` or `DELETE /v1/spaces/` for an empty
+  ID, and success was reported for whatever the server or a proxy made of
+  them. IDs are taken exactly as given, not trimmed. Blank entries in Space
+  IDs are still ignored, and a blank Reranker ID or LLM ID still means none.
 - **Retrieve emitted one item whose `json` was the raw NDJSON stream as a
   string** — statuses, boundaries, chunks and memory definitions concatenated
   and unparsed. Retrieve now emits one item per matching chunk with `chunkText`,

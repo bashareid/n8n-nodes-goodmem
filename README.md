@@ -37,10 +37,14 @@ spaces. For a server with a private certificate authority, mount the CA under
 | Reranker | List |
 
 Every ID — memory, space, embedder, reranker, LLM — must be a GoodMem UUID
-such as `123e4567-e89b-12d3-a456-426614174000`: IDs become part of the request
-URL, so any other value (`../spaces/<id>`, a padded or suffixed ID), whether
-typed, mapped from an earlier node or chosen by an agent through `$fromAI()`,
-is refused with an error naming the field before any request is made.
+such as `123e4567-e89b-12d3-a456-426614174000`. Memory IDs, and the space ID of
+Space → Get, Update, Delete and Memory → List, become part of the request URL,
+where a value such as `..` or `../spaces/<id>` could address a different
+resource; the other IDs go in the request body and are checked the same way.
+Any other value (a path, a padded or suffixed ID), whether typed, mapped from
+an earlier node or chosen by an agent through `$fromAI()`, is refused with an
+error naming the field and the item before any request is made. Blank entries
+in Space IDs are ignored, and a blank Reranker ID or LLM ID means none is used.
 
 ### Retrieve
 

@@ -5,9 +5,13 @@
  * External report against n8n 1.0.1: Memory → Delete with Memory ID
  * "../spaces/<id>" or "%2e%2e/spaces/<id>", typed or chosen by an AI agent via
  * $fromAI(), deleted the whole space and reported {"deleted": true}. 2.0
- * percent-encoded IDs, which kept dot segments inside one path segment, but
- * every such value was still sent and a 2xx still came back as success; what
- * happens to %2F on the way to GoodMem is not the node's to decide.
+ * percent-encoded IDs before this check, and that was not enough.
+ * encodeURIComponent leaves "." and ".." as they are, and the HTTP client
+ * (fetch here, axios in n8n) resolves them: Space → Delete with Space ID ".."
+ * sent DELETE /v1/ and reported {"deleted": true}, and Memory → List with ".."
+ * sent GET /v1/memories. Every other value was sent encoded, e.g.
+ * DELETE /v1/spaces/..%2Fspaces%2F<id>, and a 2xx still came back as success;
+ * what happens to %2F on the way to GoodMem is not the node's to decide.
  *
  * The recording server here answers 200 to everything, like a server or proxy
  * that accepted the request. For each ID-taking operation, each payload must
@@ -20,6 +24,7 @@ const assert = require('node:assert/strict');
 const { after, before, beforeEach, describe, it } = require('node:test');
 const { NodeOperationError } = require('n8n-workflow');
 
+const { requireUuid } = require('../dist/nodes/Goodmem/GenericFunctions');
 const { MockServer, runNode } = require('./harness');
 
 const U = '3f2b1c9a-7d4e-4a6b-9c8d-1e2f3a4b5c6d';
@@ -34,7 +39,27 @@ const PAYLOADS = [
 	`${U}?x=1`,
 	`${U}#frag`,
 	`${U}\n`,
+	// Dot segments. Percent-encoding leaves them as they are and the HTTP client
+	// resolves them, so without the check ".." as a Space ID sent DELETE /v1/.
+	'..',
+	'.',
+	// Not UUIDs, yet free of "/", "\", "%", "?", "#" and whitespace, so a check
+	// that only refuses URL-special characters would let them through.
+	'...',
+	'mem-1',
+	U.replace(/-/g, ''),
+	`{${U}}`,
+	`urn:uuid:${U}`,
+	`${U}0`,
+	`${U}${U}`,
+	U.replace('a', '\u0430'), // Cyrillic a
+	U.replace('3', '\uff13'), // fullwidth digit three
+	'\u2024\u2024', // one dot leader, twice
+	'\uff0e\uff0e', // fullwidth full stop, twice
+	`..\\spaces\\${U}`,
 ];
+// Only a string can be a UUID, even one whose String() form looks like one.
+const NON_STRINGS = [undefined, null, 42, true, {}, [U], new String(U), { toString: () => U }];
 
 /** Operations that put the ID into the URL path. */
 const PATH_IDS = [
@@ -158,7 +183,15 @@ describe('IDs are UUIDs, checked before any request', () => {
 					assert.ok(error instanceof NodeOperationError, `expected a NodeOperationError, got ${error?.constructor?.name}: ${error?.message}; server received ${JSON.stringify(server.wire())}`);
 					assert.match(error.message, new RegExp(entry.field));
 					// A blank entry in the Space IDs list is dropped, which leaves none.
-					assert.match(error.message, payload === '' && entry.name.includes('Retrieve') ? /is required/ : /must be a UUID/);
+					const blankSpaceIds = payload === '' && entry.name.includes('Retrieve');
+					assert.match(error.message, blankSpaceIds ? /is required/ : /must be a UUID/);
+					if (!blankSpaceIds) {
+						assert.ok(
+							error.description.startsWith(`Received ${JSON.stringify(payload)}.`),
+							`description: ${error.description}`,
+						);
+						assert.match(error.description, /no request is made/);
+					}
 					assert.equal(error.context.itemIndex, 0);
 					assert.deepEqual(server.wire(), [], `server received ${JSON.stringify(server.wire())}`);
 				});
@@ -213,11 +246,81 @@ describe('IDs are UUIDs, checked before any request', () => {
 	});
 
 	it('refuses IDs that are not strings at all', async () => {
-		for (const value of [undefined, null, 42, {}, [U]]) {
+		for (const value of NON_STRINGS) {
 			server.reset();
 			const error = await refusal({ resource: 'memory', operation: 'delete', memoryId: value });
 			assert.match(error.message, /Memory ID must be a UUID/, `for ${JSON.stringify(value)}`);
 			assert.deepEqual(server.wire(), []);
 		}
+	});
+
+	it('percent-encoding alone does not stop ".." or "." (why the check exists)', async () => {
+		// What 2.0 sent for Space → Delete before the check: the ID encoded, nothing else.
+		server.reset();
+		server.route('DELETE', /.*/, () => ({ body: {} }));
+		for (const id of ['..', '.']) {
+			await fetch(`${server.baseUrl}/v1/spaces/${encodeURIComponent(id)}`, { method: 'DELETE' });
+		}
+		assert.deepEqual(server.wire(), ['DELETE /v1/', 'DELETE /v1/spaces/']);
+	});
+
+	it('names the memory by its checked, lower-case ID when waiting for it times out', async () => {
+		server.reset();
+		server.route('POST', '/v1/memories', () => ({ status: 201, body: { memoryId: U.toUpperCase(), processingStatus: 'PENDING' } }));
+		server.route('GET', /.*/, () => ({ body: { processingStatus: 'PENDING' } }));
+		const error = await refusal({ resource: 'memory', operation: 'create', memorySpaceId: U, inputType: 'text', content: 'hi', wait: true, waitTimeout: 0 });
+		assert.ok(error instanceof NodeOperationError);
+		assert.equal(
+			error.message,
+			`Memory ${U} was still PENDING after 0s. It was created; check its processing status rather than storing it again.`,
+		);
+		assert.equal(error.description, `memoryId: ${U}`);
+		assert.equal(error.context.itemIndex, 0);
+		assert.deepEqual(server.wire(), ['POST /v1/memories', `GET /v1/memories/${U}`]);
+	});
+
+	it('ignores blank Space IDs entries and treats a blank Reranker or LLM ID as none', async () => {
+		await runNode(server, retrieve({ spaceIds: ['', U.toUpperCase(), '  '], retrieveOptions: { rerankerId: '', llmId: '  ' } }));
+		assert.deepEqual(server.wire(), ['POST /v1/memories:retrieve']);
+		assert.deepEqual(server.requests[0].json.spaceKeys, [{ spaceId: U }]);
+		assert.equal('postProcessor' in server.requests[0].json, false);
+	});
+});
+
+describe('requireUuid, the one ID check', () => {
+	const ctx = { getNode: () => ({ name: 'Goodmem', type: 'goodmem', typeVersion: 2, position: [0, 0], parameters: {} }) };
+
+	it('accepts a UUID in any case and returns it in lower case', () => {
+		const accepted = [
+			[U, U],
+			[U.toUpperCase(), U],
+			['3F2b1C9a-7D4e-4A6b-9C8d-1E2f3A4b5C6d', U],
+			['00000000-0000-0000-0000-000000000000', '00000000-0000-0000-0000-000000000000'],
+			['FFFFFFFF-FFFF-FFFF-FFFF-FFFFFFFFFFFF', 'ffffffff-ffff-ffff-ffff-ffffffffffff'],
+		];
+		for (const [value, expected] of accepted) assert.equal(requireUuid.call(ctx, value, 'Test ID', 0), expected);
+	});
+
+	it('refuses everything else, naming the field and the item', () => {
+		for (const value of [...PAYLOADS, ...NON_STRINGS]) {
+			assert.throws(
+				() => requireUuid.call(ctx, value, 'Test ID', 3),
+				(error) =>
+					error instanceof NodeOperationError &&
+					error.message.startsWith('Test ID must be a UUID') &&
+					error.context.itemIndex === 3,
+				`accepted ${JSON.stringify(value)}`,
+			);
+		}
+	});
+
+	it('says why without claiming that every ID goes into the URL', () => {
+		// Embedder, reranker and LLM IDs go in the request body; they are checked all the same.
+		assert.throws(
+			() => requireUuid.call(ctx, '..', 'Embedder ID', 0),
+			(error) =>
+				error.description ===
+				'Received "..". GoodMem IDs are UUIDs. Memory and space IDs are put into request URLs, where a value such as ".." could address a different resource, so every ID is checked the same way: any other value is refused and no request is made with it.',
+		);
 	});
 });

@@ -74,10 +74,14 @@ const UUID = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a
  * is a UUID, and every ID the node sends is checked here before any request
  * is made; anything else is refused with an error naming the field and item.
  *
- * Percent-encoding is not relied on: "../spaces/<id>" given to Memory → Delete
- * must never be able to become DELETE /v1/spaces/<id>, whatever a proxy or
- * the server does with %2F or %2e%2e. The value is not trimmed. Returns the
- * canonical lowercase form, which contains only hex digits and hyphens.
+ * Percent-encoding is not enough on its own. encodeURIComponent leaves "." and
+ * ".." as they are, and the HTTP client then resolves them as dot segments:
+ * without this check, Space → Delete with Space ID ".." sends DELETE /v1/ and
+ * reports {"deleted": true}. Other values are encoded, but what a proxy or the
+ * server makes of %2F or %2e%2e is not the node's to decide, so
+ * "../spaces/<id>" given to Memory → Delete is never sent at all. The value is
+ * not trimmed. Returns the canonical lowercase form, which contains only hex
+ * digits and hyphens.
  */
 export function requireUuid(
 	this: IExecuteFunctions,
@@ -98,7 +102,7 @@ export function requireUuid(
 		`${field} must be a UUID, e.g. 123e4567-e89b-12d3-a456-426614174000`,
 		{
 			itemIndex,
-			description: `Received ${received}. GoodMem IDs are UUIDs, and IDs become part of the request URL, so any other value is refused and no request is made with it.`,
+			description: `Received ${received}. GoodMem IDs are UUIDs. Memory and space IDs are put into request URLs, where a value such as ".." could address a different resource, so every ID is checked the same way: any other value is refused and no request is made with it.`,
 		},
 	);
 }
@@ -248,8 +252,8 @@ export async function waitForMemory(
 		if (Date.now() >= deadline) {
 			throw new NodeOperationError(
 				this.getNode(),
-				`Memory ${memoryId} was still ${status} after ${options.timeoutMs / 1000}s. It was created; check its processing status rather than storing it again.`,
-				{ itemIndex: options.itemIndex, description: `memoryId: ${memoryId}` },
+				`Memory ${id} was still ${status} after ${options.timeoutMs / 1000}s. It was created; check its processing status rather than storing it again.`,
+				{ itemIndex: options.itemIndex, description: `memoryId: ${id}` },
 			);
 		}
 		await sleep(intervalMs);
