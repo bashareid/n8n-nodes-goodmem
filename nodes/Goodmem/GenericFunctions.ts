@@ -67,6 +67,42 @@ function serverMessage(body: unknown, statusCode: number): string {
 	return `HTTP ${statusCode}`;
 }
 
+const UUID = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
+
+/**
+ * The one ID check. Every GoodMem ID (memory, space, embedder, reranker, LLM)
+ * is a UUID, and every ID the node sends is checked here before any request
+ * is made; anything else is refused with an error naming the field and item.
+ *
+ * Percent-encoding is not relied on: "../spaces/<id>" given to Memory → Delete
+ * must never be able to become DELETE /v1/spaces/<id>, whatever a proxy or
+ * the server does with %2F or %2e%2e. The value is not trimmed. Returns the
+ * canonical lowercase form, which contains only hex digits and hyphens.
+ */
+export function requireUuid(
+	this: IExecuteFunctions,
+	value: unknown,
+	field: string,
+	itemIndex?: number,
+): string {
+	if (typeof value === 'string' && UUID.test(value)) return value.toLowerCase();
+	let received: string;
+	try {
+		received = JSON.stringify(value) ?? String(value);
+	} catch {
+		received = String(value);
+	}
+	if (received.length > 100) received = `${received.slice(0, 100)}…`;
+	throw new NodeOperationError(
+		this.getNode(),
+		`${field} must be a UUID, e.g. 123e4567-e89b-12d3-a456-426614174000`,
+		{
+			itemIndex,
+			description: `Received ${received}. GoodMem IDs are UUIDs, and IDs become part of the request URL, so any other value is refused and no request is made with it.`,
+		},
+	);
+}
+
 export async function getBaseUrl(this: IExecuteFunctions): Promise<string> {
 	const credentials = await this.getCredentials('goodmemApi');
 	const server = String(credentials.server ?? '').trim();
@@ -195,13 +231,16 @@ export async function waitForMemory(
 	memoryId: string,
 	options: { timeoutMs: number; intervalMs?: number; itemIndex?: number },
 ): Promise<string> {
+	// The ID comes from the server's create response; it is checked like any other.
+	const id = requireUuid.call(this, memoryId, 'Memory ID from the server', options.itemIndex);
+	const path = `/memories/${encodeURIComponent(id)}`;
 	const deadline = Date.now() + options.timeoutMs;
 	const intervalMs = options.intervalMs ?? 500;
 	let status = 'PENDING';
 	for (;;) {
 		const { body } = await goodmemRequest.call(this, {
 			method: 'GET',
-			path: `/memories/${encodeURIComponent(memoryId)}`,
+			path,
 			itemIndex: options.itemIndex,
 		});
 		status = String((body as IDataObject).processingStatus ?? 'PENDING');

@@ -19,6 +19,7 @@ import {
 	isTextual,
 	listAll,
 	parseNdjson,
+	requireUuid,
 	waitForMemory,
 } from './GenericFunctions';
 
@@ -170,7 +171,8 @@ export class Goodmem implements INodeType {
 				default: '',
 				required: true,
 				displayOptions: { show: { resource: ['space'], operation: ['delete', 'get', 'update'] } },
-				description: 'The ID of the space',
+				placeholder: 'e.g. 123e4567-e89b-12d3-a456-426614174000',
+				description: 'The ID of the space, a UUID',
 			},
 			{
 				displayName: 'Name',
@@ -188,7 +190,9 @@ export class Goodmem implements INodeType {
 				default: '',
 				required: true,
 				displayOptions: { show: { resource: ['space'], operation: ['create'] } },
-				description: 'ID of the embedder that will index this space. Use Embedder → List to find one.',
+				placeholder: 'e.g. 123e4567-e89b-12d3-a456-426614174000',
+				description:
+					'UUID of the embedder that will index this space. Use Embedder → List to find one.',
 			},
 			...CHUNKING_PROPERTIES('space', 'create'),
 			KEY_VALUE_COLLECTION('Labels', 'labels', 'Labels for the space (at most 20)', {
@@ -254,7 +258,8 @@ export class Goodmem implements INodeType {
 				default: '',
 				required: true,
 				displayOptions: { show: { resource: ['memory'], operation: ['delete', 'get', 'downloadContent'] } },
-				description: 'The ID of the memory',
+				placeholder: 'e.g. 123e4567-e89b-12d3-a456-426614174000',
+				description: 'The ID of the memory, a UUID',
 			},
 			{
 				displayName: 'Space ID',
@@ -263,7 +268,8 @@ export class Goodmem implements INodeType {
 				default: '',
 				required: true,
 				displayOptions: { show: { resource: ['memory'], operation: ['create', 'list'] } },
-				description: 'The ID of the space',
+				placeholder: 'e.g. 123e4567-e89b-12d3-a456-426614174000',
+				description: 'The ID of the space, a UUID',
 			},
 			{
 				displayName: 'Include Content',
@@ -376,7 +382,7 @@ export class Goodmem implements INodeType {
 				default: [],
 				required: true,
 				displayOptions: { show: { resource: ['memory'], operation: ['retrieve'] } },
-				description: 'Spaces to search. At least one is required.',
+				description: 'UUIDs of the spaces to search. At least one is required.',
 			},
 			{
 				displayName: 'Limit',
@@ -432,7 +438,7 @@ export class Goodmem implements INodeType {
 						name: 'llmId',
 						type: 'string',
 						default: '',
-						description: 'LLM to generate an answer from the retrieved passages',
+						description: 'UUID of an LLM to generate an answer from the retrieved passages',
 					},
 					{
 						displayName: 'LLM Temperature',
@@ -455,7 +461,8 @@ export class Goodmem implements INodeType {
 						name: 'rerankerId',
 						type: 'string',
 						default: '',
-						description: 'Reranker to improve result ordering. Use Reranker → List to find one.',
+						description:
+							'UUID of a reranker to improve result ordering. Use Reranker → List to find one.',
 					},
 				],
 			},
@@ -516,6 +523,9 @@ async function runOperation(
 		binary ? { json, binary } : { json },
 	];
 	const many = (list: IDataObject[]): INodeExecutionData[] => list.map((json) => ({ json }));
+	// Every ID parameter passes the one UUID check before it is used.
+	const idParameter = (name: string, field: string): string =>
+		requireUuid.call(this, this.getNodeParameter(name, i), field, i);
 
 	/* ---------------------------------------------------------------- lists */
 	if (operation === 'list' && (resource === 'embedder' || resource === 'reranker')) {
@@ -544,7 +554,7 @@ async function runOperation(
 		if (operation === 'create') {
 			const body: IDataObject = {
 				name: this.getNodeParameter('name', i) as string,
-				spaceEmbedders: [{ embedderId: this.getNodeParameter('embedderId', i) as string }],
+				spaceEmbedders: [{ embedderId: idParameter('embedderId', 'Embedder ID') }],
 			};
 			const labels = collectionToObject(this.getNodeParameter('labels', i, {}));
 			if (Object.keys(labels).length) body.labels = labels;
@@ -566,7 +576,7 @@ async function runOperation(
 			const { body: space } = await goodmemRequest.call(this, { method: 'POST', path: '/spaces', body, itemIndex: i });
 			return one(space as IDataObject);
 		}
-		const spaceId = this.getNodeParameter('spaceId', i) as string;
+		const spaceId = idParameter('spaceId', 'Space ID');
 		const path = `/spaces/${encodeURIComponent(spaceId)}`;
 		if (operation === 'get') {
 			const { body } = await goodmemRequest.call(this, { method: 'GET', path, itemIndex: i });
@@ -598,7 +608,7 @@ async function runOperation(
 		if (operation === 'retrieve') return retrieve.call(this, i);
 
 		if (operation === 'list') {
-			const spaceId = this.getNodeParameter('memorySpaceId', i) as string;
+			const spaceId = idParameter('memorySpaceId', 'Space ID');
 			const maxItems = this.getNodeParameter('maxItems', i, 100) as number;
 			const statusFilter = this.getNodeParameter('statusFilter', i, '') as string;
 			const { items, truncated } = await listAll.call(
@@ -611,7 +621,7 @@ async function runOperation(
 		}
 
 		if (operation === 'create') {
-			const spaceId = this.getNodeParameter('memorySpaceId', i) as string;
+			const spaceId = idParameter('memorySpaceId', 'Space ID');
 			const body: IDataObject = { spaceId };
 			const inputType = this.getNodeParameter('inputType', i, 'text') as string;
 			if (inputType === 'binary') {
@@ -650,7 +660,7 @@ async function runOperation(
 			return one(memory);
 		}
 
-		const memoryId = this.getNodeParameter('memoryId', i) as string;
+		const memoryId = idParameter('memoryId', 'Memory ID');
 		const path = `/memories/${encodeURIComponent(memoryId)}`;
 
 		if (operation === 'delete') {
@@ -723,13 +733,19 @@ async function emitContent(
 async function retrieve(this: IExecuteFunctions, i: number): Promise<INodeExecutionData[]> {
 	const query = (this.getNodeParameter('query', i) as string).trim();
 	if (!query) throw new NodeOperationError(this.getNode(), 'Query must not be empty.', { itemIndex: i });
-	const spaceIds = (this.getNodeParameter('spaceIds', i) as string[]).map((s) => s.trim()).filter(Boolean);
+	// Blank entries are ignored; every other entry must be a UUID as given.
+	const spaceIds = (this.getNodeParameter('spaceIds', i) as unknown[])
+		.filter((s) => String(s ?? '').trim() !== '')
+		.map((s) => requireUuid.call(this, s, 'Space ID', i));
 	if (!spaceIds.length) throw new NodeOperationError(this.getNode(), 'At least one Space ID is required.', { itemIndex: i });
 	const limit = this.getNodeParameter('limit', i, 10) as number;
 	const filter = (this.getNodeParameter('filter', i, '') as string).trim();
 	const options = this.getNodeParameter('retrieveOptions', i, {}) as IDataObject;
-	const rerankerId = String(options.rerankerId ?? '').trim();
-	const llmId = String(options.llmId ?? '').trim();
+	// Optional: blank means "not set"; anything else must be a UUID.
+	const optionalId = (value: unknown, field: string): string =>
+		String(value ?? '').trim() ? requireUuid.call(this, value, field, i) : '';
+	const rerankerId = optionalId(options.rerankerId, 'Reranker ID');
+	const llmId = optionalId(options.llmId, 'LLM ID');
 	const fetchK = Number(options.fetchK ?? 0) || 0;
 	const relevanceThreshold = Number(options.relevanceThreshold ?? 0) || 0;
 

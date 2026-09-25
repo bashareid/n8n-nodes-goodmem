@@ -36,6 +36,12 @@ spaces. For a server with a private certificate authority, mount the CA under
 | Embedder | List |
 | Reranker | List |
 
+Every ID — memory, space, embedder, reranker, LLM — must be a GoodMem UUID
+such as `123e4567-e89b-12d3-a456-426614174000`: IDs become part of the request
+URL, so any other value (`../spaces/<id>`, a padded or suffixed ID), whether
+typed, mapped from an earlier node or chosen by an agent through `$fromAI()`,
+is refused with an error naming the field before any request is made.
+
 ### Retrieve
 
 Give it a query and one or more space IDs. Each matching passage becomes an

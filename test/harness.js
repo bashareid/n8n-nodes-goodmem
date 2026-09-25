@@ -38,7 +38,8 @@ class MockServer {
 			req.on('end', () => {
 				const url = new URL(req.url ?? '/', 'http://localhost');
 				const body = Buffer.concat(chunks).toString('utf8');
-				const recorded = { method: req.method ?? '', path: url.pathname, query: url.searchParams, headers: req.headers, body };
+				// raw is the request target exactly as it arrived on the wire.
+				const recorded = { method: req.method ?? '', raw: req.url ?? '', path: url.pathname, query: url.searchParams, headers: req.headers, body };
 				try {
 					recorded.json = body ? JSON.parse(body) : undefined;
 				} catch {
@@ -79,13 +80,21 @@ class MockServer {
 	paths() {
 		return this.requests.map((r) => `${r.method} ${r.path}`);
 	}
+
+	/** Request lines as received, query string included. */
+	wire() {
+		return this.requests.map((r) => `${r.method} ${r.raw}`);
+	}
 }
 
 function ndjson(...events) {
 	return { body: events.map((e) => JSON.stringify(e)).join('\n') + '\n', headers: { 'content-type': 'application/x-ndjson; charset=utf-8' } };
 }
 
-/** Run the real node's execute() against a mock context. Returns the output items. */
+/**
+ * Run the real node's execute() against a mock context. Returns the output items.
+ * params is an object, or a function of the item index for per-item values.
+ */
 async function runNode(server, params, options = {}) {
 	const items = options.items ?? [{ json: {} }];
 	const node = { name: 'Goodmem', type: 'goodmem', typeVersion: 2, position: [0, 0], parameters: {} };
@@ -134,7 +143,10 @@ async function runNode(server, params, options = {}) {
 		},
 		continueOnFail: () => Boolean(options.continueOnFail),
 		getCredentials: async () => ({ server: server.baseUrl, goodmemApiKey: 'test-key' }),
-		getNodeParameter: (name, _i, fallback) => (name in params ? params[name] : fallback),
+		getNodeParameter: (name, i, fallback) => {
+			const values = typeof params === 'function' ? params(i) : params;
+			return name in values ? values[name] : fallback;
+		},
 		helpers: {
 			httpRequestWithAuthentication: async function (_type, opts) {
 				return request(opts);

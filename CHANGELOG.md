@@ -15,6 +15,18 @@ are kept alongside the repository's audit notes.
 
 **Fixed**
 
+- **An ID could address a different resource.** Memory → Delete in 1.0.1,
+  given Memory ID `../spaces/<id>` or `%2e%2e/spaces/<id>` — typed, or chosen
+  by an AI agent through `$fromAI()` — was reported to delete the whole space
+  and answer `{"deleted": true}`; 1.0.1 put IDs into the URL path as given.
+  Every ID the node sends — memory, space, embedder, reranker and LLM IDs,
+  including the space ID of Memory → List and the ID polled after Create — must
+  now be a UUID. Anything else is refused with an error naming the field and
+  the item before any request is made. Percent-encoding is kept but no longer
+  relied on: on its own it still sent `DELETE /v1/spaces/..%2Fspaces%2F<id>`,
+  or `DELETE /v1/spaces/` for an empty ID, and reported success for whatever
+  the server or a proxy made of it. IDs are taken exactly as given, not
+  trimmed; blank entries in Space IDs are still ignored.
 - **Retrieve emitted one item whose `json` was the raw NDJSON stream as a
   string** — statuses, boundaries, chunks and memory definitions concatenated
   and unparsed. Retrieve now emits one item per matching chunk with `chunkText`,
@@ -70,6 +82,7 @@ are kept alongside the repository's audit notes.
 | Chunking strategy fields | `chunking`: Server Default / None / Custom (JSON) |
 | Space `requiredSpaceId`, `requiredSpaceName`, `spaceEmbedders` collection, `optionalSpaceLabels` | `spaceId`, `name`, `embedderId`, `labels` |
 | Download Content output: string item | Binary property (default `data`), or `content` for text |
+| Any string accepted as an ID | IDs must be UUIDs; anything else is refused before a request is made |
 
 The filter is a GoodMem expression typed by the workflow author. Inside a
 quoted value escape `'` as `\'` and `\` as `\\`; SQL-style `''` doubling and

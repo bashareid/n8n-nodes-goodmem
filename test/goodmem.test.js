@@ -33,6 +33,11 @@ function memoryEvent(memoryId, metadata = {}) {
 	event.memoryDefinition.metadata = metadata;
 	return event;
 }
+// GoodMem IDs are UUIDs, and the node refuses any other ID before a request
+// (see ids.test.js). IDs inside captured stream events are server data.
+const uuid = (n) => `00000000-0000-4000-8000-${String(n).padStart(12, '0')}`;
+const [S1, S2, E1, R_MISSING] = [uuid(1), uuid(2), uuid(3), uuid(4)];
+const [M1, M2, M3, M4, M_NEW, M_BIN, MISSING] = [uuid(11), uuid(12), uuid(13), uuid(14), uuid(15), uuid(16), uuid(99)];
 const status = (code, message, details) => ({ status: { ...(code ? { code } : {}), message, ...(details ? { details } : {}) } });
 const INFO = status('FEATURE_DISABLED', 'Abstract reply generation disabled', { feature: 'summarization', required_param: 'llm_id' });
 
@@ -83,7 +88,7 @@ describe('Goodmem node execute()', () => {
 	after(() => server.stop());
 	beforeEach(() => server.reset());
 
-	const retrieveParams = (extra = {}) => ({ resource: 'memory', operation: 'retrieve', query: 'codeword', spaceIds: ['s1'], limit: 10, ...extra });
+	const retrieveParams = (extra = {}) => ({ resource: 'memory', operation: 'retrieve', query: 'codeword', spaceIds: [S1], limit: 10, ...extra });
 
 	it('emits one item per chunk with joined metadata, via POST with the NDJSON accept header', async () => {
 		// n8n 1.0.1: one item whose json was the whole stream as a 4755-char string
@@ -98,18 +103,18 @@ describe('Goodmem node execute()', () => {
 		const req = server.requests[0];
 		assert.equal(req.method, 'POST');
 		assert.equal(req.headers.accept, 'application/x-ndjson');
-		assert.deepEqual(req.json.spaceKeys, [{ spaceId: 's1' }]);
+		assert.deepEqual(req.json.spaceKeys, [{ spaceId: S1 }]);
 		assert.equal(req.query.has('message'), false, 'query text travels in the body, not the URL');
 	});
 
 	it('flags failed reranking instead of reporting success', async () => {
 		// n8n 1.0.1: NOT_FOUND + RERANKING_FAILED buried in the string; execution status "success"
 		server.route('POST', ':retrieve', () => ndjson(status('NOT_FOUND', 'Reranker not found'), INFO, status('RERANKING_FAILED', 'Failed to create reranker client'), memoryEvent('m1'), chunkEvent('c1', 'fallback', 'm1')));
-		const items = await runNode(server, retrieveParams({ retrieveOptions: { rerankerId: 'r-missing' } }));
+		const items = await runNode(server, retrieveParams({ retrieveOptions: { rerankerId: R_MISSING } }));
 		assert.equal(items.length, 1);
 		assert.equal(items[0].json.partial, true);
 		assert.deepEqual(items[0].json.statuses.map((s) => s.code), ['NOT_FOUND', 'RERANKING_FAILED']);
-		assert.equal(server.requests[0].json.postProcessor.config.reranker_id, 'r-missing');
+		assert.equal(server.requests[0].json.postProcessor.config.reranker_id, R_MISSING);
 	});
 
 	it('returns no items and flags a search that failed outright (contract Q4b)', async () => {
@@ -160,8 +165,8 @@ describe('Goodmem node execute()', () => {
 	it('passes the filter through verbatim on every space key', async () => {
 		server.route('POST', ':retrieve', () => ndjson(INFO));
 		const filter = "CAST(val('$.owner') AS TEXT) = 'o\\'brien'";
-		await runNode(server, retrieveParams({ spaceIds: ['s1', 's2'], filter }));
-		assert.deepEqual(server.requests[0].json.spaceKeys, [{ spaceId: 's1', filter }, { spaceId: 's2', filter }]);
+		await runNode(server, retrieveParams({ spaceIds: [S1, S2], filter }));
+		assert.deepEqual(server.requests[0].json.spaceKeys, [{ spaceId: S1, filter }, { spaceId: S2, filter }]);
 	});
 
 	it('refuses a relevance threshold without a reranker', async () => {
@@ -183,27 +188,27 @@ describe('Goodmem node execute()', () => {
 	it('create waits for the memory it wrote, and never by searching', async () => {
 		// 1.0.1 returned PENDING with no way to wait; a following Retrieve found nothing
 		let polls = 0;
-		server.route('POST', '/v1/memories', () => ({ status: 201, body: { memoryId: 'm-new', spaceId: 's1', processingStatus: 'PENDING' } }));
-		server.route('GET', '/v1/memories/m-new', () => ({ body: { memoryId: 'm-new', processingStatus: ++polls < 3 ? 'PENDING' : 'COMPLETED' } }));
-		const items = await runNode(server, { resource: 'memory', operation: 'create', memorySpaceId: 's1', inputType: 'text', content: 'hello', wait: true, waitTimeout: 10 });
+		server.route('POST', '/v1/memories', () => ({ status: 201, body: { memoryId: M_NEW, spaceId: S1, processingStatus: 'PENDING' } }));
+		server.route('GET', `/v1/memories/${M_NEW}`, () => ({ body: { memoryId: M_NEW, processingStatus: ++polls < 3 ? 'PENDING' : 'COMPLETED' } }));
+		const items = await runNode(server, { resource: 'memory', operation: 'create', memorySpaceId: S1, inputType: 'text', content: 'hello', wait: true, waitTimeout: 10 });
 		assert.equal(items[0].json.processingStatus, 'COMPLETED');
-		assert.equal(server.paths().filter((p) => p === 'GET /v1/memories/m-new').length, 3);
+		assert.equal(server.paths().filter((p) => p === `GET /v1/memories/${M_NEW}`).length, 3);
 		assert.equal(server.paths().filter((p) => p.endsWith(':retrieve')).length, 0);
 	});
 
 	it('create with wait off returns immediately', async () => {
-		server.route('POST', '/v1/memories', () => ({ status: 201, body: { memoryId: 'm-new', processingStatus: 'PENDING' } }));
-		const items = await runNode(server, { resource: 'memory', operation: 'create', memorySpaceId: 's1', inputType: 'text', content: 'hello', wait: false });
+		server.route('POST', '/v1/memories', () => ({ status: 201, body: { memoryId: M_NEW, processingStatus: 'PENDING' } }));
+		const items = await runNode(server, { resource: 'memory', operation: 'create', memorySpaceId: S1, inputType: 'text', content: 'hello', wait: false });
 		assert.equal(items[0].json.processingStatus, 'PENDING');
 		assert.equal(server.requests.length, 1);
 	});
 
 	it('create from an n8n binary property sends the bytes base64 with the file type', async () => {
-		server.route('POST', '/v1/memories', () => ({ status: 201, body: { memoryId: 'm-bin', processingStatus: 'COMPLETED' } }));
+		server.route('POST', '/v1/memories', () => ({ status: 201, body: { memoryId: M_BIN, processingStatus: 'COMPLETED' } }));
 		const bytes = Buffer.from([0x25, 0x50, 0x44, 0x46, 0xe2, 0xe3, 0xcf, 0xd3]);
 		await runNode(
 			server,
-			{ resource: 'memory', operation: 'create', memorySpaceId: 's1', inputType: 'binary', inputBinaryPropertyName: 'data', wait: false },
+			{ resource: 'memory', operation: 'create', memorySpaceId: S1, inputType: 'binary', inputBinaryPropertyName: 'data', wait: false },
 			{ items: [{ json: {}, binary: { data: { data: bytes.toString('base64'), mimeType: 'application/pdf', fileName: 'report.pdf' } } }] },
 		);
 		const body = server.requests[0].json;
@@ -214,8 +219,8 @@ describe('Goodmem node execute()', () => {
 
 	it('get decodes text content from base64 into a readable field', async () => {
 		// 1.0.1 passed originalContent through as raw base64
-		server.route('GET', '/v1/memories/m1', () => ({ body: { memoryId: 'm1', contentType: 'text/plain', originalContent: Buffer.from('The audit codeword is ZEPHYR-7.').toString('base64') } }));
-		const items = await runNode(server, { resource: 'memory', operation: 'get', memoryId: 'm1', includeContent: true });
+		server.route('GET', `/v1/memories/${M1}`, () => ({ body: { memoryId: M1, contentType: 'text/plain', originalContent: Buffer.from('The audit codeword is ZEPHYR-7.').toString('base64') } }));
+		const items = await runNode(server, { resource: 'memory', operation: 'get', memoryId: M1, includeContent: true });
 		assert.equal(items[0].json.content, 'The audit codeword is ZEPHYR-7.');
 		assert.equal('originalContent' in items[0].json, false);
 		assert.equal(server.requests[0].query.get('includeContent'), 'true');
@@ -223,8 +228,8 @@ describe('Goodmem node execute()', () => {
 
 	it('get hands binary content over as n8n binary data, bytes intact', async () => {
 		const pdf = Buffer.from([0x25, 0x50, 0x44, 0x46, 0x2d, 0x0a, 0x25, 0xe2, 0xe3, 0xcf, 0xd3, 0x0a]);
-		server.route('GET', '/v1/memories/m2', () => ({ body: { memoryId: 'm2', contentType: 'application/pdf', metadata: { title: 'audit.pdf' }, originalContent: pdf.toString('base64') } }));
-		const items = await runNode(server, { resource: 'memory', operation: 'get', memoryId: 'm2', includeContent: true, binaryPropertyName: 'data' });
+		server.route('GET', `/v1/memories/${M2}`, () => ({ body: { memoryId: M2, contentType: 'application/pdf', metadata: { title: 'audit.pdf' }, originalContent: pdf.toString('base64') } }));
+		const items = await runNode(server, { resource: 'memory', operation: 'get', memoryId: M2, includeContent: true, binaryPropertyName: 'data' });
 		const binary = items[0].binary.data;
 		assert.equal(binary.mimeType, 'application/pdf');
 		assert.equal(binary.fileName, 'audit.pdf');
@@ -235,18 +240,18 @@ describe('Goodmem node execute()', () => {
 	it('download returns binary bytes unchanged', async () => {
 		// n8n 1.0.1: 132 of 196 bytes became U+FFFD and no binary property was produced
 		const body = Buffer.concat([Buffer.from('%PDF-1.4\n%'), Buffer.from(Array.from({ length: 128 }, (_, k) => 0x80 + k)), Buffer.from('\n%%EOF\n')]);
-		server.route('GET', '/v1/memories/m3/content', () => ({ body, headers: { 'content-type': 'application/pdf' } }));
-		server.route('GET', '/v1/memories/m3', () => ({ body: { memoryId: 'm3', contentType: 'application/pdf' } }));
-		const items = await runNode(server, { resource: 'memory', operation: 'downloadContent', memoryId: 'm3', binaryPropertyName: 'file' });
+		server.route('GET', `/v1/memories/${M3}/content`, () => ({ body, headers: { 'content-type': 'application/pdf' } }));
+		server.route('GET', `/v1/memories/${M3}`, () => ({ body: { memoryId: M3, contentType: 'application/pdf' } }));
+		const items = await runNode(server, { resource: 'memory', operation: 'downloadContent', memoryId: M3, binaryPropertyName: 'file' });
 		assert.ok(Buffer.from(items[0].binary.file.data, 'base64').equals(body));
 		assert.equal(items[0].binary.file.mimeType, 'application/pdf');
 	});
 
 	it('download returns text as a readable field on an object item', async () => {
 		// n8n 1.0.1: the item's json was a bare string
-		server.route('GET', '/v1/memories/m4/content', () => ({ body: Buffer.from('plain words'), headers: { 'content-type': 'text/plain' } }));
-		server.route('GET', '/v1/memories/m4', () => ({ body: { memoryId: 'm4', contentType: 'text/plain' } }));
-		const items = await runNode(server, { resource: 'memory', operation: 'downloadContent', memoryId: 'm4' });
+		server.route('GET', `/v1/memories/${M4}/content`, () => ({ body: Buffer.from('plain words'), headers: { 'content-type': 'text/plain' } }));
+		server.route('GET', `/v1/memories/${M4}`, () => ({ body: { memoryId: M4, contentType: 'text/plain' } }));
+		const items = await runNode(server, { resource: 'memory', operation: 'downloadContent', memoryId: M4 });
 		assert.equal(typeof items[0].json, 'object');
 		assert.equal(items[0].json.content, 'plain words');
 	});
@@ -255,23 +260,23 @@ describe('Goodmem node execute()', () => {
 		// n8n 1.0.1 showed "Your request is invalid or could not be processed by the service"
 		server.route('POST', '/v1/spaces', () => ({ status: 409, body: { error: 'A space with this name already exists', status: 409 } }));
 		await assert.rejects(
-			runNode(server, { resource: 'space', operation: 'create', name: 'dup', embedderId: 'e1' }),
+			runNode(server, { resource: 'space', operation: 'create', name: 'dup', embedderId: E1 }),
 			(err) => /409/.test(err.message) && /A space with this name already exists/.test(err.message),
 		);
 	});
 
 	it('update space sends only name and label fields', async () => {
-		server.route('PUT', '/v1/spaces/s1', (req) => ({ body: { spaceId: 's1', ...req.json } }));
-		await runNode(server, { resource: 'space', operation: 'update', spaceId: 's1', newName: 'renamed', labelMode: 'merge', updateLabels: { entries: [{ key: 'env', value: 'prod' }] } });
+		server.route('PUT', `/v1/spaces/${S1}`, (req) => ({ body: { spaceId: S1, ...req.json } }));
+		await runNode(server, { resource: 'space', operation: 'update', spaceId: S1, newName: 'renamed', labelMode: 'merge', updateLabels: { entries: [{ key: 'env', value: 'prod' }] } });
 		assert.deepEqual(server.requests[0].json, { name: 'renamed', mergeLabels: { env: 'prod' } });
-		await assert.rejects(runNode(server, { resource: 'space', operation: 'update', spaceId: 's1' }), /Nothing to update/);
+		await assert.rejects(runNode(server, { resource: 'space', operation: 'update', spaceId: S1 }), /Nothing to update/);
 	});
 
 	it('create space sends the embedder and an explicit default chunking config', async () => {
 		server.route('POST', '/v1/spaces', (req) => ({ status: 201, body: { spaceId: 'new', ...req.json } }));
-		await runNode(server, { resource: 'space', operation: 'create', name: 'n', embedderId: 'e1', labels: { entries: [{ key: 'a', value: 'b' }] } });
+		await runNode(server, { resource: 'space', operation: 'create', name: 'n', embedderId: E1, labels: { entries: [{ key: 'a', value: 'b' }] } });
 		const body = server.requests[0].json;
-		assert.deepEqual(body.spaceEmbedders, [{ embedderId: 'e1' }]);
+		assert.deepEqual(body.spaceEmbedders, [{ embedderId: E1 }]);
 		assert.deepEqual(body.labels, { a: 'b' });
 		assert.ok(body.defaultChunkingConfig, 'POST /spaces rejects a missing defaultChunkingConfig');
 		assert.equal('publicRead' in body, false);
@@ -285,8 +290,8 @@ describe('Goodmem node execute()', () => {
 	});
 
 	it('continue-on-fail turns an error into an item instead of stopping the run', async () => {
-		server.route('GET', '/v1/memories/missing', () => ({ status: 404, body: { error: 'not found' } }));
-		const items = await runNode(server, { resource: 'memory', operation: 'get', memoryId: 'missing', includeContent: false }, { continueOnFail: true });
+		server.route('GET', `/v1/memories/${MISSING}`, () => ({ status: 404, body: { error: 'not found' } }));
+		const items = await runNode(server, { resource: 'memory', operation: 'get', memoryId: MISSING, includeContent: false }, { continueOnFail: true });
 		assert.match(String(items[0].json.error), /404/);
 	});
 });
